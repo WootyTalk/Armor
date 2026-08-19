@@ -682,9 +682,11 @@ describe("analyzeGuardrail", () => {
   });
 
   // The input direction has no assistant reply to rewrite: the analyzed text is the CUSTOMER's
-  // message. Asked for a "replacement message" anyway, the model composes one from an empty desk,
-  // and measured against gpt-5.4-mini it wrote in the customer's own voice 10 times in 16 and named
-  // a banned competitor 8 times in 16. Dropping the guidance is not enough on its own — the response
+  // message. Asked for a "replacement message" anyway, the model composes one from an empty desk:
+  // measured over 32 runs it wrote in the customer's own voice 18 times and named a banned
+  // competitor 14 times, and on gpt-4o-mini a customer who ASKED for a particular reply got it word
+  // for word, 16 times out of 16. This test is that case's regression: the fake model returns a
+  // replacement and the analyzer must still hand back none. Dropping the guidance is not enough on its own — the response
   // shape still asks for `suggestedReply` — so the field is zeroed here and the runtime falls back
   // to the configured template. Same shape and same reason as answer_relevance (#95, #99).
   test("an input violation never carries a replacement, whatever the model wrote", async () => {

@@ -204,7 +204,7 @@ export function GuardrailsTab({
                     : dir === "input"
                       ? t(
                           "editor.guardrails.templateInboundHint",
-                          "On the customer's message this is ALWAYS what gets sent. There is nothing to rewrite here, because the text under review is the customer's own message, so the guardrails agent is never asked to compose a reply: when it was, it wrote as if it were the customer in 10 runs out of 16, and named a competitor from your own list in 8 out of 16.",
+                          "On the customer's message this is ALWAYS what gets sent. There is nothing to rewrite here, because the text under review is the customer's own message, so the guardrails agent is never asked to compose a reply. When it was, the customer could dictate that reply: a message telling it to state a price and a partnership produced exactly that, word for word, in every one of 16 runs.",
                         )
                       : t(
                           "editor.guardrails.templateFallbackHint",

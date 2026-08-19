@@ -1390,10 +1390,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // On the INPUT direction there is no assistant reply to rewrite — the analyzed text is the
     // CUSTOMER's own message — so `generated` has nothing to repair and the model composes from an
     // empty desk: no agent prompt, no knowledge base, no account data (`runGuardrail` passes
-    // systemPrompt and customerMessage as undefined for input). Measured against gpt-5.4-mini,
-    // 16 replacements per case: the model wrote in the CUSTOMER's voice 10/16 (the bot posting the
-    // customer's own complaint back at them, "Vocês são muito ruins; vocês nunca respondem nada"),
-    // and named a competitor the operator had banned in 8/16 of the case that mentioned one.
+    // systemPrompt and customerMessage as undefined for input). Measured live, 32 runs per case:
+    // against gpt-5.4-mini it wrote in the CUSTOMER's voice 18/32 (the bot posting the customer's
+    // own complaint back at them) and named an operator-banned competitor 14/32. Worse on
+    // gpt-4o-mini, where the customer's message could DICTATE the reply: one instructing the
+    // reviewer to state a price and a partnership produced exactly that, verbatim, 16/16.
     // So the replacement is dropped and the configured template goes out, exactly as
     // answer_relevance already does for the same reason (issues #95, #99).
     test("input 'generated' → sends the template, never a composed reply", async () => {
