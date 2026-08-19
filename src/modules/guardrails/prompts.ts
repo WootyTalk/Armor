@@ -134,9 +134,18 @@ export function buildGuardrailSystemPrompt(p: GuardrailPromptParams): string {
     "Respond with ONLY a JSON object (no markdown, no prose) of the form:",
     '{"violated": boolean, "categories": string[], "rationale": string, "suggestedReply": string | null}',
     '`categories` lists the violated policy keys (e.g. "toxicity"). `rationale` is one short sentence. ' +
-      "`suggestedReply` is a safe, polite replacement message in the SAME language as the analyzed text " +
-      "(what the assistant could say instead, following the guidance above when present), or null. When " +
-      'nothing is violated, set "violated" to false and "categories" to [].',
+      // NOTE: The shape stays identical in both directions; only what `suggestedReply` may hold
+      // changes. On input it is always null — asking for a replacement there and discarding it in
+      // ./analyze would pay for output tokens on every violation, and would leave the console's
+      // claim that this direction never asks for a composed reply true only after the fact.
+      (p.direction === "input"
+        ? "`suggestedReply` must ALWAYS be null on this direction: the analyzed text is the " +
+          "customer's own message, so there is no assistant reply to replace and you must not " +
+          "compose one. "
+        : "`suggestedReply` is a safe, polite replacement message in the SAME language as the " +
+          "analyzed text (what the assistant could say instead, following the guidance above when " +
+          "present), or null. ") +
+      'When nothing is violated, set "violated" to false and "categories" to [].',
   );
   return lines.join("\n");
 }

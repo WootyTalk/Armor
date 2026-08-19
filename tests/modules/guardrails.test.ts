@@ -296,6 +296,22 @@ describe("buildGuardrailSystemPrompt", () => {
     });
     expect(p).not.toContain("Offer a human handoff.");
   });
+
+  // Dropping the guidance is not the same as not asking. The response shape is the same in both
+  // directions, so without this the model still composes a reply on every input violation — output
+  // tokens paid for a string ./analyze then throws away. Measured after the change: violations were
+  // still detected 16/16 on all four input fixtures, so requiring null does not blunt the judge.
+  test("an input prompt requires a null suggestedReply", () => {
+    const p = buildGuardrailSystemPrompt({ ...base, direction: "input" });
+    expect(p).toContain("`suggestedReply` must ALWAYS be null");
+    expect(p).not.toContain("what the assistant could say instead");
+  });
+
+  test("an output prompt still asks for the replacement", () => {
+    const p = buildGuardrailSystemPrompt(base);
+    expect(p).toContain("what the assistant could say instead");
+    expect(p).not.toContain("must ALWAYS be null");
+  });
 });
 
 // The decision that keeps the customer's words away from the policies that judge the reply. Tested
