@@ -1387,7 +1387,16 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(sent).toEqual([]);
     });
 
-    test("input 'generated' → delivers the suggestedReply and skips the agent graph", async () => {
+    // On the INPUT direction there is no assistant reply to rewrite — the analyzed text is the
+    // CUSTOMER's own message — so `generated` has nothing to repair and the model composes from an
+    // empty desk: no agent prompt, no knowledge base, no account data (`runGuardrail` passes
+    // systemPrompt and customerMessage as undefined for input). Measured against gpt-5.4-mini,
+    // 16 replacements per case: the model wrote in the CUSTOMER's voice 10/16 (the bot posting the
+    // customer's own complaint back at them, "Vocês são muito ruins; vocês nunca respondem nada"),
+    // and named a competitor the operator had banned in 8/16 of the case that mentioned one.
+    // So the replacement is dropped and the configured template goes out, exactly as
+    // answer_relevance already does for the same reason (issues #95, #99).
+    test("input 'generated' → sends the template, never a composed reply", async () => {
       await setGuardrails({
         enabled: true,
         provider: "openai",
@@ -1428,8 +1437,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
       });
       expect(outcome).toBe("posted");
-      // The generated suggestedReply is delivered — NOT the template, NOT the agent's own REPLY.
-      expect(sent).toEqual([[940, "GEN-IN-REPLY"]]);
+      // The template goes out. The model DID write a replacement (the fake verdict carries one) and
+      // it is discarded — that is the whole rule, and asserting only "not GEN-IN-REPLY" would pass
+      // for a turn that posted nothing at all.
+      expect(sent).toEqual([[940, "TEMPLATE-IN"]]);
+      // Still skips the agent graph: the customer never gets the agent's own REPLY either.
+      expect(sent.some(([, text]) => text === REPLY)).toBe(false);
       // The operator is notified via a private note so a replaced reply is never invisible.
       expect(notes.length).toBe(1);
     });

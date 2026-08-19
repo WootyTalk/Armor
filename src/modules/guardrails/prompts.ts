@@ -119,7 +119,10 @@ export function buildGuardrailSystemPrompt(p: GuardrailPromptParams): string {
   if (p.customPolicy.trim()) {
     lines.push("", `Additional policy: ${p.customPolicy.trim()}`);
   }
-  if (p.generationPrompt?.trim()) {
+  // NOTE: Output only. An input violation never delivers a replacement (see ./analyze), so steering
+  // how one is written steers nothing — and the operator's guidance is usually "be warm, answer
+  // them", which is an instruction to do the thing that direction must not do.
+  if (p.direction === "output" && p.generationPrompt?.trim()) {
     lines.push(
       "",
       "When writing `suggestedReply`, follow this guidance:",

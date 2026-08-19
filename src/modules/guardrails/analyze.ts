@@ -191,9 +191,11 @@ export function splitAnalyses(p: AnalysisParams): {
   };
 }
 
-// A relevance analysis never proposes a replacement, so the runtime falls back to the configured
-// template message. Dropping the generation guidance is not enough on its own: the response shape
-// still asks for `suggestedReply`, and a model that writes one anyway would have it delivered.
+// Strips the proposed replacement, so the runtime falls back to the configured template message.
+// Two callers, and they are the two analyses with nothing to rewrite: a relevance violation (below)
+// and the whole INPUT direction (see `analyzeGuardrail`). Dropping the generation guidance is not
+// enough on its own for either: the response shape still asks for `suggestedReply`, and a model that
+// writes one anyway would have it delivered.
 //
 // It must not write one. A relevance violation means the reply did not ANSWER, so there is nothing
 // to rewrite and the model has to invent the answer, with no tools, no knowledge base and no
@@ -235,7 +237,18 @@ export async function analyzeGuardrail(
   params: AnalysisParams,
 ): Promise<GuardrailVerdict> {
   const { policies, relevance } = splitAnalyses(params);
-  if (relevance === null) return runAnalysis(model, policies as AnalysisParams);
+  if (relevance === null) {
+    const verdict = await runAnalysis(model, policies as AnalysisParams);
+    // NOTE: The INPUT direction never delivers a replacement. There is no assistant reply to repair
+    // there — the analyzed text is the CUSTOMER's message — so "write a safe replacement" has no
+    // referent and the model composes one from an empty desk. Measured against gpt-5.4-mini, 16 per
+    // case: it wrote in the customer's own VOICE in 10 of 16 (the bot posting a tidied version of
+    // the customer's insult back at them) and named an operator-banned competitor in 8 of 16.
+    // Constraining it by wording was measured too and held at 0 of 64 — but what it then produces is
+    // one fixed sentence ("Não posso ajudar com mensagens ofensivas. Se quiser, reformule…"), which
+    // is a template the operator can write once, without a model call and without the residual risk.
+    return params.direction === "input" ? withoutReplacement(verdict) : verdict;
+  }
   if (policies === null) {
     return withoutReplacement(await runAnalysis(model, relevance));
   }
