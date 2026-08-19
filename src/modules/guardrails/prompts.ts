@@ -138,6 +138,14 @@ export function buildGuardrailSystemPrompt(p: GuardrailPromptParams): string {
       // changes. On input it is always null — asking for a replacement there and discarding it in
       // ./analyze would pay for output tokens on every violation, and would leave the console's
       // claim that this direction never asks for a composed reply true only after the fact.
+      //
+      // It also closes an injection surface, which was measured rather than predicted. The
+      // customer's message reaches this model at user level, so asking the model to WRITE something
+      // makes any "write this instead" inside that message an on-task instruction. Against
+      // gpt-4.1-nano, an abusive message carrying one was judged CLEAN 16 of 16 — the customer had
+      // switched the guardrail off and passed straight through to the agent — while the same model
+      // caught the same abuse without the injection 16 of 16. With this line the injected order has
+      // no task to attach to, and the violation is caught 16 of 16.
       (p.direction === "input"
         ? "`suggestedReply` must ALWAYS be null on this direction: the analyzed text is the " +
           "customer's own message, so there is no assistant reply to replace and you must not " +
