@@ -14,7 +14,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Link,
@@ -51,7 +51,7 @@ import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { computeConfigIssues, issueHasAction } from "@/client/lib/configHealth";
-import { slugify } from "@/client/lib/utils";
+import { formatRelativeTime, slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
   useVaultBaseUrls,
@@ -62,6 +62,7 @@ import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
+import type { Schedule } from "@/modules/business-hours/hours";
 import {
   CHANNEL_REDIRECT_DEFAULTS,
   type ChannelRedirectConfig,
@@ -73,6 +74,7 @@ import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
 } from "@/modules/guardrails/settings";
+import { readMemoryConfig } from "@/modules/memory/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { BehaviorTab, type SendImageState } from "./BehaviorTab";
 import {
@@ -103,6 +105,17 @@ type AgentResp = Awaited<
   ReturnType<ReturnType<typeof api.api.v1.agents>["get"]>
 >;
 type Agent = NonNullable<AgentResp["data"]>["agent"];
+// Derived, never hand-declared (docs/eden-treaty.md): a mirrored interface drifts the moment the
+// controller adds a field, and it did. Written by hand this type omitted `lastError`, which is the
+// one part of the reading that names the vendor's refusal, so the warning it feeds could only give
+// generic advice about a cause the server had already identified.
+type GuardrailHealthResp = NonNullable<
+  Awaited<
+    ReturnType<
+      ReturnType<typeof api.api.v1.agents>["guardrails"]["health"]["get"]
+    >
+  >["data"]
+>;
 type TabKey =
   | "general"
   | "channels"
@@ -276,6 +289,7 @@ function readBehaviorState(a: Agent) {
   const li = (s.limits ?? {}) as Record<string, unknown>;
   const ac = (s.attributeContext ?? {}) as Record<string, unknown>;
   const si = (s.sendImage ?? {}) as Record<string, unknown>;
+  const av = (s.availability ?? {}) as Record<string, unknown>;
 
   // NOTE: Attribute keys per scope: plain string lists (the runtime reader trims/dedups/caps them).
   const attrKeys = (v: unknown): string[] =>
@@ -289,6 +303,8 @@ function readBehaviorState(a: Agent) {
     businessHoursId: a.businessHoursId ?? "",
     followUpHoursId: a.followUpHoursId ?? "",
     settings: s,
+    awayEnabled: av.enabled === true,
+    awayMessage: str(av.awayMessage),
     debounce: {
       enabled: typeof d.enabled === "boolean" ? d.enabled : true,
       windowSeconds: num(d.windowSeconds) || "15",
@@ -365,6 +381,10 @@ function readBehaviorState(a: Agent) {
     // here would show the switch off while values were being logged, and would then persist that lie
     // on the next save.
     observability: readObservabilityConfig(s),
+    // NOTE: Same reason as observability above — through the runtime's own reader, because this one
+    // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
+    // predates the feature, then persist that lie on the next save.
+    memory: { compactionEnabled: readMemoryConfig(s).compaction.enabled },
   };
 }
 
@@ -511,7 +531,7 @@ export function AgentEditorPage() {
 }
 
 function AgentEditor() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { showToast } = useToast();
   const navigate = useNavigate();
   const { id = "", tab: tabParam } = useParams();
@@ -554,6 +574,8 @@ function AgentEditor() {
   );
   const [transferWithSummary, setTransferWithSummary] = useState(true);
   const [businessHoursId, setBusinessHoursId] = useState("");
+  const [awayEnabled, setAwayEnabled] = useState(false);
+  const [awayMessage, setAwayMessage] = useState("");
   const [followUpHoursId, setFollowUpHoursId] = useState("");
   // Free-form settings bag, preserved on save so editing one section never wipes another
   // (e.g. grounding). The debounce sub-state mirrors settings.debounce (see modules/debounce).
@@ -617,6 +639,9 @@ function AgentEditor() {
   // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
   // agent.settings.observability (modules/flowlog/settings).
   const [observability, setObservability] = useState({ logToolValues: false });
+  // Whether an attendance that ended is folded into a summary. Mirrors agent.settings.memory
+  // (modules/memory/settings), which defaults to ON.
+  const [memory, setMemory] = useState({ compactionEnabled: true });
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -707,6 +732,24 @@ function AgentEditor() {
 
   // Pools
   const [hours, setHours] = useState<Hours[]>([]);
+  // The Availability the prompt preview resolves {{esta_aberto}} & co. against: the schedule this
+  // agent is bound to, as the Behavior tab currently has it (unsaved changes included, so the preview
+  // answers for the schedule the operator is looking at). Not configured → null, which the runtime and
+  // the gate both read as always on.
+  const promptAvailability = useMemo(() => {
+    const h = hours.find((x) => String(x.id) === businessHoursId);
+    // Built field by field rather than passed through: the sibling picker guards windows/exceptions
+    // with `?? []` for rows that come back without them, and a preview is not the place to find out.
+    return {
+      schedule: h
+        ? {
+            windows: (h.windows ?? []) as Schedule["windows"],
+            exceptions: (h.exceptions ?? []) as Schedule["exceptions"],
+            timezone: h.timezone,
+          }
+        : null,
+    };
+  }, [hours, businessHoursId]);
 
   const confirm = useModalController<ConfirmPayload>();
   const cloneModal = useModalController();
@@ -782,6 +825,8 @@ function AgentEditor() {
     setModel(readModelState(a));
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -793,6 +838,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
@@ -815,6 +861,8 @@ function AgentEditor() {
     syncedAgentRef.current = a;
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -826,6 +874,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
@@ -869,6 +918,10 @@ function AgentEditor() {
       bumpSync(...SECTION_KEYS);
       setStaleNotice(false);
       setConflictRetry(null);
+      // The other half of the sync tick. A reload is an explicit "tell me the current state", and
+      // without it the server-read parts of the page would answer with whatever they read the first
+      // time, which is the state the operator just asked to replace.
+      setServerSyncTick((n) => n + 1);
       if (hoursRes.data) setHours([...hoursRes.data.businessHours]);
     } catch {
       setError(true);
@@ -1002,6 +1055,7 @@ function AgentEditor() {
       // reading the live channelRedirect form in a Behavior save would clobber that tab's unsaved
       // edits. The `...settings` spread preserves the last-synced channelRedirect; saveChannelRedirect
       // keeps that bag in step after its own write (same pattern as saveTools does for handoff/kanban).
+      availability: { enabled: awayEnabled, awayMessage: awayMessage.trim() },
       debounce: {
         enabled: debounce.enabled,
         windowSeconds: Number(debounce.windowSeconds) || 15,
@@ -1081,6 +1135,7 @@ function AgentEditor() {
         maxHistoryTokens: Number(limits.maxHistoryTokens) || null,
       },
       observability: { logToolValues: observability.logToolValues },
+      memory: { compaction: { enabled: memory.compactionEnabled } },
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1112,6 +1167,8 @@ function AgentEditor() {
     // bag including tool-owned handoff/kanban) so a Tools save never falsely lights up Behavior's dot.
     behavior: JSON.stringify({
       businessHoursId,
+      awayEnabled,
+      awayMessage,
       followUpHoursId,
       debounce,
       stt,
@@ -1124,6 +1181,7 @@ function AgentEditor() {
       attributeContext,
       sendImage,
       observability,
+      memory,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1208,6 +1266,51 @@ function AgentEditor() {
     };
   }, []);
 
+  // What the guardrail screen actually DID lately, for the panel below. Configuration cannot answer
+  // it: a retired model id, a parameter the vendor rejects and a chronic timeout are all valid
+  // configuration until the call is made, and the pass is fail-open, so each one delivers messages
+  // as if they had been reviewed.
+  //
+  // A snapshot, not a subscription, and `serverSyncTick` is what decides when it is retaken: every
+  // successful load (including the Reload the stale-state banner offers) and every successful save.
+  // Those are the two moments the operator expects a fresh answer. Nothing is fetched before the
+  // first load completes (the tick starts at 0), so the page does not spend a request answering a
+  // question about an agent it has not read yet.
+  //
+  // It does NOT follow live traffic. An editor left open does not learn about failures that started
+  // meanwhile, and closing that gap by polling costs a request a minute on every open editor to
+  // shorten a wait that ends the next time anybody loads or saves.
+  //
+  // A request that fails clears the snapshot instead of leaving the last one on screen, and a null
+  // snapshot is read by the panel as "nothing to say" rather than as a warning. Both halves are the
+  // same call the panel already makes for an unloaded vault list: under-reporting for a moment is
+  // the safe direction, because a stale count invites acting on a number nobody can vouch for, and
+  // a line saying the console could not reach its own API is not actionable from this screen.
+  const [serverSyncTick, setServerSyncTick] = useState(0);
+  const [guardrailHealth, setGuardrailHealth] =
+    useState<GuardrailHealthResp | null>(null);
+  const guardrailsOn = guardrails.enabled;
+  useEffect(() => {
+    if (!id || !guardrailsOn || serverSyncTick === 0) {
+      setGuardrailHealth(null);
+      return;
+    }
+    let alive = true;
+    api.api.v1
+      .agents({ id })
+      .guardrails.health.get()
+      .then(({ data }) => {
+        if (!alive) return;
+        setGuardrailHealth(data ?? null);
+      })
+      .catch(() => {
+        if (alive) setGuardrailHealth(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [id, guardrailsOn, serverSyncTick]);
+
   // Live config-health (item 1): features turned on but missing the credential they need to run, OR
   // referencing a credential whose secret is not filled in yet (pending). The import that strips
   // secrets is the common trigger; each issue deep-links to its tab + section, or to the vault fill
@@ -1221,6 +1324,8 @@ function AgentEditor() {
   // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
   // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
   // t('editor.configIssueUnresolved.guardrails', 'The guardrails credential no longer exists, so messages go out unscreened.')
+  // t('editor.configIssueGuardrailsFailing', 'Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. Check the model, the endpoint and the key.')
+  // t('editor.configIssueGuardrailsFailingCause', 'Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. The last one said: {{error}}')
   // t('editor.configIssuePending.model', 'The model credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.stt', 'The transcription credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.tts', 'The audio-reply credential is referenced but not filled in yet.')
@@ -1273,6 +1378,8 @@ function AgentEditor() {
     visionCredentialRef: vision.credentialRef,
     guardrailsEnabled: guardrails.enabled,
     guardrailsCredentialRef: guardrails.credentialRef ?? "",
+    guardrailsFailures: guardrailHealth?.failures,
+    guardrailsLastFailureAt: guardrailHealth?.lastAt,
     pendingRefs,
     knownRefs,
     knowledgeBasesNeedingIndex,
@@ -1358,6 +1465,40 @@ function AgentEditor() {
         { name: issue.knowledgeBaseName ?? "" },
       );
     }
+    // A guardrail that HAS its credential and still could not run. The count is the whole point: the
+    // panel's other lines describe a state ("no key set"), this one describes what already happened,
+    // and an operator has to be told that those turns went out unscreened rather than blocked.
+    if (issue.key === "guardrailsFailing") {
+      const params = {
+        failures: issue.failures ?? 0,
+        hours: guardrailHealth?.windowHours ?? 24,
+        when: issue.lastFailureAt
+          ? formatRelativeTime(issue.lastFailureAt, i18n.language)
+          : "-",
+        error: guardrailHealth?.lastError ?? "",
+      };
+      // The vendor's own words when they survived the write, generic advice when they did not. They
+      // are what separates "look at this" from "fix this": "400 temperature is not supported" names
+      // the setting, while a list of three things to check makes the operator try all of them.
+      //
+      // The line stops at what a failure row proves, which is less than it looks. It does not say
+      // the message went out unscreened: a failed input check leaves the output check free to screen
+      // the reply, and a split output analysis merges both halves, so it can carry an error from one
+      // and a violation from the other and still replace or suppress the send. All that is certain
+      // is fail-open, and it applies to the failed check alone: that one caught nothing and held
+      // nothing back.
+      return params.error
+        ? t(
+            "editor.configIssueGuardrailsFailingCause",
+            "Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. The last one said: {{error}}",
+            params,
+          )
+        : t(
+            "editor.configIssueGuardrailsFailing",
+            "Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. Check the model, the endpoint and the key.",
+            params,
+          );
+    }
     if (issue.pending) {
       // biome-ignore lint/plugin/no-dynamic-i18n-key: pending keys registered via magic comments above computeConfigIssues
       return t(`editor.configIssuePending.${issue.key}` as const, {
@@ -1436,6 +1577,12 @@ function AgentEditor() {
         return t(
           "editor.importWarning.hoursReused",
           'Business hours "{{name}}" already existed and were reused; check the schedule is right.',
+          p,
+        );
+      case "httpToolBodyIgnored":
+        return t(
+          "editor.importWarning.httpToolBodyIgnored",
+          'Tool "{{name}}" had a request body in a shape this version does not accept, so it was reduced to the part that was actually being sent. The request is unchanged; open it under Body to check it.',
           p,
         );
       case "httpToolReused":
@@ -1648,6 +1795,7 @@ function AgentEditor() {
   // those need saving). Read fresh at send time inside the hook, so it always reflects the form.
   const getDraft = () => ({
     systemPrompt,
+    businessHoursId,
     modelConfig: buildModelConfig(),
     settings: buildSettings(),
   });
@@ -1680,6 +1828,8 @@ function AgentEditor() {
     if (!a) return;
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -1691,6 +1841,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
@@ -1777,6 +1928,10 @@ function AgentEditor() {
     if (updatedAt) loadedUpdatedAtRef.current = updatedAt;
     setStaleNotice(false);
     setConflictRetry(null);
+    // Every successful save funnels through here, which makes it one of the two places that can tell
+    // the server-read parts of this page to look again (the other is `load`). A save is the
+    // operator's "I fixed it", and the guardrail health snapshot is the first reader of the tick.
+    setServerSyncTick((n) => n + 1);
   }
 
   async function saveAgent(
@@ -2464,6 +2619,7 @@ function AgentEditor() {
 
             {tab === "general" && (
               <GeneralTab
+                availability={promptAvailability}
                 name={name}
                 setName={setName}
                 systemPrompt={systemPrompt}
@@ -2560,6 +2716,10 @@ function AgentEditor() {
                 hours={hours}
                 businessHoursId={businessHoursId}
                 setBusinessHoursId={setBusinessHoursId}
+                awayEnabled={awayEnabled}
+                setAwayEnabled={setAwayEnabled}
+                awayMessage={awayMessage}
+                setAwayMessage={setAwayMessage}
                 followUpHoursId={followUpHoursId}
                 setFollowUpHoursId={setFollowUpHoursId}
                 debounce={debounce}
@@ -2593,6 +2753,8 @@ function AgentEditor() {
                 visionCredBaseUrl={visionCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
+                memory={memory}
+                setMemory={setMemory}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}
@@ -2773,6 +2935,10 @@ function AgentEditor() {
               name: businessHoursReviewItem.name,
               timezone: businessHoursReviewItem.timezone,
               windows: businessHoursReviewItem.windows.map((w) => ({ ...w })),
+              exceptions: businessHoursReviewItem.exceptions.map((e) => ({
+                ...e,
+                ranges: e.ranges.map((r) => ({ ...r })),
+              })),
             }}
             onSaved={() => businessHoursReviewModal.close()}
             onCancel={() => businessHoursReviewModal.close()}

@@ -5987,6 +5987,116 @@
         "operationId": "deleteV1AgentsById"
       }
     },
+    "/v1/agents/{id}/guardrails/health": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Get guardrail health",
+        "description": "Counts the guardrail analyses that could not run for this agent in the recent window, with the most recent one and the error it carried. Analysis is fail-open, so a check counted here caught nothing and held nothing back. It does not follow that the turn went out unscreened: the other direction may still have screened it, and a split output analysis can carry an error from one half and a violation from the other.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Agent id, a BigInt encoded as a decimal string.",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1AgentsByIdGuardrailsHealth"
+      }
+    },
     "/v1/agents/{id}/clone": {
       "post": {
         "tags": [
@@ -6933,6 +7043,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7000,6 +7114,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7065,6 +7183,10 @@
                     "properties": {
                       "systemPrompt": {
                         "maxLength": 100000,
+                        "type": "string"
+                      },
+                      "businessHoursId": {
+                        "maxLength": 20,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7202,7 +7324,7 @@
           "Agents"
         ],
         "summary": "List playground tools",
-        "description": "Returns the agent's tools (name, description, category, risk, auto-simulated flag) for the simulate-a-return UI.",
+        "description": "Returns the agent's tools (name, description, category, auto-simulated flag) for the simulate-a-return UI.",
         "parameters": [
           {
             "name": "id",
@@ -7358,6 +7480,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7417,6 +7543,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7474,6 +7604,10 @@
                     "properties": {
                       "systemPrompt": {
                         "maxLength": 100000,
+                        "type": "string"
+                      },
+                      "businessHoursId": {
+                        "maxLength": 20,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7653,6 +7787,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -7720,6 +7858,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -7785,6 +7927,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7973,6 +8119,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8052,6 +8202,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8129,6 +8283,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8321,6 +8479,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8388,6 +8550,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8453,6 +8619,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8641,6 +8811,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8724,6 +8898,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8805,6 +8983,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -9915,7 +10097,7 @@
                     }
                   },
                   "body": {
-                    "description": "Request body template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "description": "Request body. `{\"mode\":\"kv\",\"rows\":[{\"key\":…,\"value\":…}]}` assembles a flat JSON payload from the rows; `{\"mode\":\"raw\",\"raw\":\"…\"}` sends the template as written, which is how a NESTED payload is built. In both, {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time, and single-brace {param} is normalized when it matches a declared input field or context variable. `{}` (or absent) is the legacy fallback and does NOT mean an empty request: it assembles the payload from the declared input fields. For an empty JSON payload use `{\"mode\":\"kv\",\"rows\":[]}`; for no body content at all, `{\"mode\":\"raw\",\"raw\":\"\"}`. Any other shape is refused: a plain JSON object reads like a template and is not one — it would be discarded and the request sent assembled from the declared input fields instead.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -9935,14 +10117,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -10051,7 +10225,7 @@
                     }
                   },
                   "body": {
-                    "description": "Request body template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "description": "Request body. `{\"mode\":\"kv\",\"rows\":[{\"key\":…,\"value\":…}]}` assembles a flat JSON payload from the rows; `{\"mode\":\"raw\",\"raw\":\"…\"}` sends the template as written, which is how a NESTED payload is built. In both, {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time, and single-brace {param} is normalized when it matches a declared input field or context variable. `{}` (or absent) is the legacy fallback and does NOT mean an empty request: it assembles the payload from the declared input fields. For an empty JSON payload use `{\"mode\":\"kv\",\"rows\":[]}`; for no body content at all, `{\"mode\":\"raw\",\"raw\":\"\"}`. Any other shape is refused: a plain JSON object reads like a template and is not one — it would be discarded and the request sent assembled from the declared input fields instead.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -10071,14 +10245,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -10187,7 +10353,7 @@
                     }
                   },
                   "body": {
-                    "description": "Request body template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "description": "Request body. `{\"mode\":\"kv\",\"rows\":[{\"key\":…,\"value\":…}]}` assembles a flat JSON payload from the rows; `{\"mode\":\"raw\",\"raw\":\"…\"}` sends the template as written, which is how a NESTED payload is built. In both, {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time, and single-brace {param} is normalized when it matches a declared input field or context variable. `{}` (or absent) is the legacy fallback and does NOT mean an empty request: it assembles the payload from the declared input fields. For an empty JSON payload use `{\"mode\":\"kv\",\"rows\":[]}`; for no body content at all, `{\"mode\":\"raw\",\"raw\":\"\"}`. Any other shape is refused: a plain JSON object reads like a template and is not one — it would be discarded and the request sent assembled from the declared input fields instead.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -10207,14 +10373,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -10559,7 +10717,7 @@
                     }
                   },
                   "body": {
-                    "description": "Request body template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "description": "Request body. `{\"mode\":\"kv\",\"rows\":[{\"key\":…,\"value\":…}]}` assembles a flat JSON payload from the rows; `{\"mode\":\"raw\",\"raw\":\"…\"}` sends the template as written, which is how a NESTED payload is built. In both, {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time, and single-brace {param} is normalized when it matches a declared input field or context variable. `{}` (or absent) is the legacy fallback and does NOT mean an empty request: it assembles the payload from the declared input fields. For an empty JSON payload use `{\"mode\":\"kv\",\"rows\":[]}`; for no body content at all, `{\"mode\":\"raw\",\"raw\":\"\"}`. Any other shape is refused: a plain JSON object reads like a template and is not one — it would be discarded and the request sent assembled from the declared input fields instead.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -10579,14 +10737,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -10695,7 +10845,7 @@
                     }
                   },
                   "body": {
-                    "description": "Request body template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "description": "Request body. `{\"mode\":\"kv\",\"rows\":[{\"key\":…,\"value\":…}]}` assembles a flat JSON payload from the rows; `{\"mode\":\"raw\",\"raw\":\"…\"}` sends the template as written, which is how a NESTED payload is built. In both, {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time, and single-brace {param} is normalized when it matches a declared input field or context variable. `{}` (or absent) is the legacy fallback and does NOT mean an empty request: it assembles the payload from the declared input fields. For an empty JSON payload use `{\"mode\":\"kv\",\"rows\":[]}`; for no body content at all, `{\"mode\":\"raw\",\"raw\":\"\"}`. Any other shape is refused: a plain JSON object reads like a template and is not one — it would be discarded and the request sent assembled from the declared input fields instead.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -10715,14 +10865,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -10831,7 +10973,7 @@
                     }
                   },
                   "body": {
-                    "description": "Request body template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "description": "Request body. `{\"mode\":\"kv\",\"rows\":[{\"key\":…,\"value\":…}]}` assembles a flat JSON payload from the rows; `{\"mode\":\"raw\",\"raw\":\"…\"}` sends the template as written, which is how a NESTED payload is built. In both, {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time, and single-brace {param} is normalized when it matches a declared input field or context variable. `{}` (or absent) is the legacy fallback and does NOT mean an empty request: it assembles the payload from the declared input fields. For an empty JSON payload use `{\"mode\":\"kv\",\"rows\":[]}`; for no body content at all, `{\"mode\":\"raw\",\"raw\":\"\"}`. Any other shape is refused: a plain JSON object reads like a template and is not one — it would be discarded and the request sent assembled from the declared input fields instead.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -10851,14 +10993,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -12352,6 +12486,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12407,6 +12591,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12460,6 +12694,56 @@
                         "day",
                         "start",
                         "end"
+                      ]
+                    }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
                       ]
                     }
                   }
@@ -12734,6 +13018,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12789,6 +13123,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12842,6 +13226,56 @@
                         "day",
                         "start",
                         "end"
+                      ]
+                    }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
                       ]
                     }
                   }
