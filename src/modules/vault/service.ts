@@ -1,7 +1,7 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import basePrisma from "@/api/lib/prisma";
-import { parseDbId } from "@/lib/db-id";
+import { MAX_DB_ID, parseDbId } from "@/lib/db-id";
 import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { SETTINGS_CREDENTIAL_PATHS } from "@/modules/agents/credential-paths";
@@ -39,15 +39,40 @@ export function isVaultIdRef(ref: string): boolean {
   return ref.startsWith(VAULT_REF_PREFIX);
 }
 
-export function vaultRefWhere(ref: string): { id: bigint } {
-  if (ref.startsWith(VAULT_REF_PREFIX)) {
-    try {
-      return { id: BigInt(ref.slice(VAULT_REF_PREFIX.length)) };
-    } catch {
-      // malformed → fall through to a never-matching id
-    }
+// The id a STORED ref names, by the reader's rule rather than the writer's.
+//
+// The two rules are deliberately different and this is the one place that says why. `requireVaultRef`
+// refuses everything but the canonical spelling on the way IN, so a column holds one form. A reader
+// still has to resolve what is already there: refs predate that rule, and `canonicalVaultRef`
+// (src/client/lib/credentialRef.ts) states the contract every resolver keeps — `vault:0007`,
+// `vault: 7` and `vault:7` are the same entry. Reading strictly would report a working credential as
+// missing and silently switch a model or an integration off after an upgrade.
+//
+// What it does NOT tolerate is a value no `bigint` column can hold. `BigInt` is arbitrary precision,
+// so `vault:<digits past 2^63-1>` converts and reaches Postgres as a bind error — a 500 out of a
+// resolver whose contract is to answer "no such entry". Lenient about SPELLING, bounded by RANGE.
+//
+// One function because it was eight, and none of them agreed: four spelled the prefix as a literal
+// `"vault:"`, three could throw where their caller expected a null, and every one of them was
+// missing the bound. Issue #407.
+export function readVaultRefId(ref: string): bigint | null {
+  if (!ref.startsWith(VAULT_REF_PREFIX)) return null;
+  const raw = ref.slice(VAULT_REF_PREFIX.length);
+  // NOTE: `BigInt("")` is `0n`, so a bare `vault:` named row zero rather than nothing. No column
+  // ever holds that id, so nothing observable turned on it — but "a prefix with no id after it
+  // names an entry" is not a rule this file should be able to be read as having.
+  if (raw.trim() === "") return null;
+  let id: bigint;
+  try {
+    id = BigInt(raw);
+  } catch {
+    return null;
   }
-  return { id: -1n };
+  return id < 0n || id > MAX_DB_ID ? null : id;
+}
+
+export function vaultRefWhere(ref: string): { id: bigint } {
+  return { id: readVaultRefId(ref) ?? -1n };
 }
 
 // A "pending" entry holds only encryptJson({}) as a placeholder — its secret was never filled. Strict
@@ -59,6 +84,7 @@ function pendingCredentialError(ref: string): AppError {
     `vault secret "${ref}" has not been filled yet`,
     409,
     "errors.credentialPending",
+    { ref },
   );
 }
 
@@ -243,12 +269,27 @@ export async function resolveVaultRefByName(
 export async function requireVaultRef(
   db: ScopedDb,
   ref: string,
+  // The server's own name for the input this ref arrived in — a column (`credentialRef`) or a dotted
+  // path into a bag it owns (`settings.tts.normalizeCredentialRef`). See src/api/lib/refusal.ts.
+  //
+  // REQUIRED, and that is the whole guard: every caller here already holds the name, and eleven of
+  // the thirteen were still omitting it. The argument for optional was that most callers "refuse a
+  // column the client already named in the patch it sent" — but what the client SENT and what the
+  // server REFUSED are different questions, which is the premise of #231. An integrations write
+  // carries `credentialRef` and `inboundSecretRef` in one body; a tool write carries `credentialRef`
+  // among sixteen keys. A refusal with no field is unplaceable by any form, however well wired.
+  //
+  // A required parameter and not a sweep: the omission is invisible at every call site, so the type
+  // is the only reader that sees the next one. Issue #320.
+  field: string,
 ): Promise<string> {
   const malformed = () =>
     new AppError(
       `"${ref}" is not a vault reference (expected vault:<id>)`,
       400,
       "errors.invalidVaultRef",
+      { ref },
+      field,
     );
   if (!ref.startsWith(VAULT_REF_PREFIX)) throw malformed();
   const raw = ref.slice(VAULT_REF_PREFIX.length);
@@ -268,6 +309,8 @@ export async function requireVaultRef(
       `vault secret "${ref}" not found`,
       400,
       "errors.vaultRefNotFound",
+      { ref },
+      field,
     );
   }
   return formatVaultRef(entry.id);
@@ -342,6 +385,38 @@ function validateParamName(raw: string, kind: string): string {
   return trimmed;
 }
 
+// A credential is stored as its exact bytes, so a paste artifact is not a detail: an HTTP field
+// value has its surrounding whitespace stripped before any handler sees it, so a token stored with a
+// trailing newline can never be matched by the one that arrives, and the refusal that follows is
+// byte-identical to a wrong token (issue #338).
+//
+// This REFUSES rather than trimming, and the difference is the whole point. Trimming would repair
+// the header case silently while breaking the one where the bytes are shared rather than sent: an
+// HMAC key never travels, both sides hold it, and `createHmac` uses it verbatim — so rewriting ours
+// would fail every signature at the provider instead of here. Refusing changes no secret, needs no
+// per-kind exception, and hands the operator the one fact they could not see.
+// The sentence names the field when there is one, because that is the only place the name survives:
+// `AppError.field` is dropped by the MCP writer (`failOf` sends `e.message`) and by the console's
+// save-error path, so a padded Langfuse key would otherwise refuse with a sentence that cannot say
+// WHICH of the two is padded — for whitespace, of all things, which the operator cannot see.
+function assertNoSurroundingWhitespace(value: string, field?: string): void {
+  if (value === value.trim()) return;
+  if (field !== undefined) {
+    throw new AppError(
+      `value.${field} must not begin or end with whitespace`,
+      400,
+      "errors.vaultFieldWhitespace",
+      { field },
+      field,
+    );
+  }
+  throw new AppError(
+    "vault secret must not begin or end with whitespace",
+    400,
+    "errors.vaultSecretWhitespace",
+  );
+}
+
 // Validates the secret value against the kind's declared shape.
 // - kinds with `fields` declared: must be a Record<string, string> with exactly those keys, all non-empty.
 // - all other kinds: must be a non-empty string.
@@ -375,9 +450,15 @@ function validateVaultValue(kind: string, value: unknown): void {
         throw new AppError(
           `value.${key} must be a non-empty string`,
           400,
-          "errors.invalidVaultValue",
+          "errors.vaultFieldRequired",
+          { field: key },
+          // NOTE: the credential form renders one input per declared field and keys it by exactly this
+          // (`fieldValues[f.key]`, src/client/components/CredentialForm.tsx), so the key IS the
+          // console's name for the input that was refused.
+          key,
         );
       }
+      assertNoSurroundingWhitespace(v, key);
     }
     // Reject extra keys not in the declared field list.
     const declaredKeys = new Set(fields.map((f) => f.key));
@@ -386,7 +467,8 @@ function validateVaultValue(kind: string, value: unknown): void {
         throw new AppError(
           `value has unexpected key: ${k}`,
           400,
-          "errors.invalidVaultValue",
+          "errors.vaultFieldUnknown",
+          { field: k },
         );
       }
     }
@@ -398,6 +480,7 @@ function validateVaultValue(kind: string, value: unknown): void {
         "errors.emptyVaultSecret",
       );
     }
+    assertNoSurroundingWhitespace(value);
   }
 }
 
@@ -562,6 +645,7 @@ export async function createVaultEntry(
       throw new ConflictError(
         "vault entry name and type already in use",
         "errors.vaultNameInUse",
+        "name",
       );
     }
     const blob = encryptJson(rawValue);
@@ -583,6 +667,7 @@ export async function createVaultEntry(
         throw new ConflictError(
           "vault entry name and type already in use",
           "errors.vaultNameInUse",
+          "name",
         );
       }
       throw e;
@@ -664,6 +749,7 @@ export async function createPendingVaultEntry(
       throw new ConflictError(
         "vault entry name and type already in use",
         "errors.vaultNameInUse",
+        "name",
       );
     }
     // Placeholder blob: an empty object, never a real secret. `status` discriminates it from active.
@@ -687,6 +773,7 @@ export async function createPendingVaultEntry(
         throw new ConflictError(
           "vault entry name and type already in use",
           "errors.vaultNameInUse",
+          "name",
         );
       }
       throw e;
@@ -740,6 +827,7 @@ export async function updateVaultEntry(
         throw new ConflictError(
           "vault entry name and type already in use",
           "errors.vaultNameInUse",
+          "name",
         );
       }
       data.name = newName;
@@ -783,6 +871,7 @@ export async function updateVaultEntry(
         throw new ConflictError(
           "vault entry name and type already in use",
           "errors.vaultNameInUse",
+          "name",
         );
       }
       throw e;
@@ -814,6 +903,12 @@ export async function testVaultValue(
 ): Promise<SecretTestResult> {
   if (kind && !isSecretTypeId(kind)) {
     throw new AppError("invalid secret type", 400, "errors.invalidSecretType");
+  }
+  // A value the write would refuse is not a connectivity question, and probing it answers the wrong
+  // one: fetch strips the padding out of a header, so a fixed-header kind reports "Connection OK"
+  // and the save then refuses the same bytes.
+  if (value !== value.trim()) {
+    return { testable: true, ok: false, code: "surrounding_whitespace" };
   }
   return runSecretTest({ kind, value, baseURL, paramName }, deps);
 }
@@ -921,8 +1016,8 @@ export async function vaultReferences(
             // vault UI then offers to delete a key the runtime is about to need.
             OR: [
               { modelConfig: { path: ["credentialRef"], equals: idRef } },
-              ...SETTINGS_CREDENTIAL_PATHS.map(({ block, field }) => ({
-                settings: { path: [block, field], equals: idRef },
+              ...SETTINGS_CREDENTIAL_PATHS.map(({ path }) => ({
+                settings: { path: [...path], equals: idRef },
               })),
             ],
           },

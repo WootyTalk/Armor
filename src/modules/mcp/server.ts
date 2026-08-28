@@ -7,6 +7,10 @@ import config from "@/config";
 import { AppError } from "@/lib/errors";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import type { TenantContext } from "@/lib/tenancy";
+import {
+  BEHAVIOR_PATCH_SHAPE,
+  type BehaviorPatchArgs,
+} from "@/modules/agents/settings-schema";
 import { exportAgent } from "@/modules/agents/transfer";
 import { listConversations } from "@/modules/conversations/service";
 import { FLOW_LEVELS, FLOW_STAGES } from "@/modules/flowlog/stages";
@@ -15,6 +19,7 @@ import {
   runPlaygroundFileTurn,
   runPlaygroundTurn,
 } from "@/modules/playground/service";
+import { OUTBOUND_DELIVERY_STATUSES } from "@/modules/webhooks/outbound/deliveries";
 import { hasScope, type VerifiedToken } from "./oauth/tokens";
 import {
   agentGet,
@@ -26,6 +31,10 @@ import {
   businessHoursList,
   conversationGet,
   conversationMessages,
+  documentStarterList,
+  documentTemplateGet,
+  documentTemplateList,
+  documentTemplateSchema,
   experimentGet,
   experimentList,
   experimentResultsGet,
@@ -34,6 +43,7 @@ import {
   instanceList,
   integrationCatalog,
   integrationList,
+  issuedDocumentList,
   knowledgeApprovalsList,
   knowledgeDocumentsList,
   knowledgeList,
@@ -48,6 +58,8 @@ import {
   toolList,
   vaultList,
   vaultReferencesGet,
+  webhookDeliveryGet,
+  webhookDeliveryList,
   webhookEventsList,
   webhookList,
 } from "./read";
@@ -62,6 +74,7 @@ import {
   brandingAssetSet,
   brandingSet,
   credentialCreate,
+  parseMcpId,
   promptSet,
   tenantUpdate,
   type WriteResult,
@@ -89,6 +102,7 @@ import {
   inboxBind,
   inboxReconcile,
   inboxReconnect,
+  inboxRemove,
   instanceDisconnect,
   instanceListAccounts,
   instanceSyncInboxes,
@@ -100,6 +114,12 @@ import {
   conversationReturn,
   conversationStatus,
 } from "./write-conversations";
+import {
+  type DocumentTemplateWriteArgs,
+  documentTemplateCreate,
+  documentTemplateDelete,
+  documentTemplateUpdate,
+} from "./write-documents";
 import { tenantCreate, tenantGet, tenantList } from "./write-fleet";
 import {
   knowledgeApprove,
@@ -133,6 +153,7 @@ import {
   integrationUpdate,
   webhookCreate,
   webhookDelete,
+  webhookDeliveryRequeue,
   webhookTest,
   webhookUpdate,
 } from "./write-webhooks";
@@ -271,6 +292,17 @@ export function isAudioMime(mime: string): boolean {
   return mime.startsWith("audio/") || mime === "video/webm";
 }
 
+// The per-turn options every playground branch passes on, mapped once. They were read inline in
+// each of the three (text / audio / file), which is how the guardrail toggle reached one of them
+// and not the others. Exported because the forwarding is the whole contract with the third
+// transport, and there is no way to prove it end to end without a real provider call.
+export function playgroundTurnOptions(args: {
+  reply_with_audio?: boolean;
+  guardrails?: boolean;
+}): { forceAudio: boolean | undefined; guardrails: boolean | undefined } {
+  return { forceAudio: args.reply_with_audio, guardrails: args.guardrails };
+}
+
 export function buildMcpServer(principal: VerifiedToken): McpServer {
   const server = new McpServer(
     {
@@ -400,7 +432,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_playground",
       {
         description:
-          "Chat with one of the tenant's agents in an isolated PLAYGROUND thread (no Chatwoot, no real customer). Runs the SAME model + system prompt + knowledge/HTTP/MCP/integration tools as production, MINUS the native conversation tools (handoff/resolve/…). Send a text `message`, OR an `attachment` (voice note / image / document) exactly like the console playground does: audio is transcribed (STT) and image/document content is extracted (vision) with the agent's configured providers, then the agent answers what it would in production (the response adds `transcription` for audio or `kind`+`extracted` for files). Returns { reply, threadId, trace, sources, … }: pass threadId back to continue the session with memory; `trace` is the sanitized execution trace (tool calls/args, results, errors — never secrets); `sources` are the KB passages the answer was grounded on. Set `reply_with_audio` to force a spoken (TTS) reply for this turn. CAUTION: the agent's HTTP/integration tools still execute for real (a write tool will write), so treat this as a live test, not a pure simulation.",
+          "Chat with one of the tenant's agents in an isolated PLAYGROUND thread (no Chatwoot, no real customer). Runs the SAME model + system prompt + knowledge/HTTP/MCP/integration tools as production, MINUS the native conversation tools (handoff/resolve/…). Send a text `message`, OR an `attachment` (voice note / image / document) exactly like the console playground does: audio is transcribed (STT) and image/document content is extracted (vision) with the agent's configured providers, then the agent answers what it would in production (the response adds `transcription` for audio or `kind`+`extracted` for files). Returns { reply, threadId, trace, sources, … }: pass threadId back to continue the session with memory; `trace` is the sanitized execution trace (tool calls/args, results, errors — never secrets); `sources` are the KB passages the answer was grounded on. Set `reply_with_audio` to force a spoken (TTS) reply for this turn, and `guardrails: false` to skip the moderation pass (it runs by default, exactly as in the console). CAUTION: the agent's HTTP/integration tools still execute for real (a write tool will write), so treat this as a live test, not a pure simulation.",
         inputSchema: {
           agent_id: z.string(),
           message: z
@@ -439,6 +471,12 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
             .describe(
               "Force an audio (TTS) reply for this turn regardless of the agent's saved reply mode.",
             ),
+          guardrails: z
+            .boolean()
+            .optional()
+            .describe(
+              "Run the agent's guardrails over this turn (default true, matching the console). False skips the screening model call entirely, which is up to two paid calls on an output turn.",
+            ),
         },
       },
       async (
@@ -448,39 +486,58 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           thread_id?: string;
           attachment?: McpPlaygroundAttachment;
           reply_with_audio?: boolean;
+          guardrails?: boolean;
         },
         eff,
       ) => {
         try {
-          const tenantId = eff.tenantId as bigint;
-          const agentId = BigInt(args.agent_id);
+          // The principal's OWN context, not an id rebuilt from it. A fleet token resolved its
+          // `tenant` selector on the way in (tenant-target.ts) and keeps SUPER_ADMIN, so the scoped
+          // boundary verifies the target once more and a tenant deleted between the two answers a
+          // refusal rather than an empty playground. Issue #268.
+          const ctx = principalCtx(eff);
+          // Same parser as every other id: a padded or empty agent_id must not resolve to some
+          // other agent's row.
+          const parsedAgent = parseMcpId(args.agent_id, "agent_id");
+          if (typeof parsedAgent !== "bigint") {
+            return {
+              content: [
+                { type: "text" as const, text: JSON.stringify(parsedAgent) },
+              ],
+              isError: true,
+            };
+          }
+          const agentId = parsedAgent;
           const threadId = args.thread_id;
-          const forceAudio = args.reply_with_audio;
+          const { forceAudio, guardrails } = playgroundTurnOptions(args);
           let res: unknown;
           if (args.attachment) {
             const file = await mcpAttachmentToFile(args.attachment);
             res = isAudioMime(file.type)
               ? await runPlaygroundAudioTurn({
-                  tenantId,
+                  ctx,
                   agentId,
                   file,
                   threadId,
                   forceAudio,
+                  guardrails,
                 })
               : await runPlaygroundFileTurn({
-                  tenantId,
+                  ctx,
                   agentId,
                   file,
                   threadId,
                   forceAudio,
+                  guardrails,
                 });
           } else if (args.message?.trim()) {
             res = await runPlaygroundTurn({
-              tenantId,
+              ctx,
               agentId,
               message: args.message,
               threadId,
               forceAudio,
+              guardrails,
             });
           } else {
             return {
@@ -521,10 +578,16 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       },
       async (args: { agent_id: string }, eff) => {
         try {
-          const data = await exportAgent(
-            principalCtx(eff),
-            BigInt(args.agent_id),
-          );
+          const parsedAgent = parseMcpId(args.agent_id, "agent_id");
+          if (typeof parsedAgent !== "bigint") {
+            return {
+              content: [
+                { type: "text" as const, text: JSON.stringify(parsedAgent) },
+              ],
+              isError: true,
+            };
+          }
+          const data = await exportAgent(principalCtx(eff), parsedAgent);
           return {
             content: [{ type: "text" as const, text: JSON.stringify(data) }],
           };
@@ -762,6 +825,59 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await webhookEventsList(eff)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "webhook_delivery_list",
+      {
+        description:
+          "List outbound webhook DELIVERIES (id, subscriptionId, subscriptionEnabled, event, status, attempts, nextAttemptAt, deliveredAt, lastError), newest first. status=DEAD is the dead-letter view: what the worker gave up on. The payload is never returned. Keyset paginated via cursor; limit max 200. Requeue a dead one with webhook_delivery_requeue.",
+        inputSchema: {
+          // NOTE: derived from the module's vocabulary, never hand-listed — the enum on the model
+          // also carries FAILED, which only the inbound side writes, and a hand copy is how a
+          // filter ends up advertising a value that can never match.
+          status: z.enum(OUTBOUND_DELIVERY_STATUSES).optional(),
+          subscription_id: z.string().optional(),
+          event: z.string().optional(),
+          since: z
+            .string()
+            .optional()
+            .describe("ISO date, lower bound on enqueue time."),
+          until: z
+            .string()
+            .optional()
+            .describe("ISO date, upper bound on enqueue time."),
+          limit: z.number().int().optional(),
+          cursor: z.string().optional(),
+        },
+      },
+      async (
+        args: {
+          status?: string;
+          subscription_id?: string;
+          event?: string;
+          since?: string;
+          until?: string;
+          limit?: number;
+          cursor?: string;
+        },
+        eff,
+      ) => writeContent(await webhookDeliveryList(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "webhook_delivery_get",
+      {
+        description:
+          "Get one outbound webhook delivery by id. Same fields as webhook_delivery_list; the payload is never returned.",
+        inputSchema: { delivery_id: z.string() },
+      },
+      async (args: { delivery_id: string }, eff) =>
+        writeContent(await webhookDeliveryGet(eff, args)),
     );
 
     registerTenantTool(
@@ -1056,6 +1172,86 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       async (args: { conversation_id: string }, eff) =>
         writeContent(await conversationMessages(eff, args)),
     );
+
+    // The document READS live here with every other *_list/*_get, not with the writes below: the
+    // scope contract in docs/mcp.md is that mcp:read sees everything that only reads, and these
+    // five went out inside the write block — invisible to a read-only token even though their own
+    // implementations go through readGate.
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_list",
+      {
+        description:
+          "List the tenant's document templates (id, name, slug, the agent tool name it produces, declared fields, block count, numbering). The blocks themselves come from document_template_get.",
+        inputSchema: {},
+      },
+      async (_args, eff) => writeContent(await documentTemplateList(eff)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_get",
+      {
+        description:
+          "Get one document template in full: its blocks, declared fields and style, exactly as document_template_update accepts them.",
+        inputSchema: { document_template_id: z.string() },
+      },
+      async (args: { document_template_id: string }, eff) =>
+        writeContent(await documentTemplateGet(eff, args)),
+    );
+
+    // NOTE: the block vocabulary is served HERE, on demand, instead of being published in every
+    // tools/list as the input schema of the two write tools. A document block is a six-variant
+    // discriminated union, and JSON Schema publishes a union by inlining every variant — measured at
+    // ~3.2k characters per tool, paid by every client on every session, for a contract only a caller
+    // actually authoring a template needs. Nothing on the client side renders a form for a six-way
+    // oneOf, so the cost buys nothing. The enforcement is not weakened: the service validates
+    // strictly, and its refusal names the block and the rule.
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_schema",
+      {
+        description:
+          "The authoring contract for document templates: JSON Schema for every block type, for a declared field and for the style, plus the full {{token}} list. Generated from the validator itself, so it is exactly what document_template_create accepts. Call it once before authoring blocks.",
+        inputSchema: {},
+      },
+      async (_args, eff) => writeContent(await documentTemplateSchema(eff)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "document_starters_list",
+      {
+        description:
+          "List the ready-made document templates (quote, proposal, receipt) that document_template_create can start from with `starter`.",
+        inputSchema: { locale: z.enum(["pt-BR", "en-US"]).optional() },
+      },
+      async (args: { locale?: "pt-BR" | "en-US" }, eff) =>
+        writeContent(await documentStarterList(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "issued_document_list",
+      {
+        description:
+          "List documents the tenant has issued (id, title, number, template, status, thread, revoked). The PDFs themselves are served only to an authenticated console session.",
+        inputSchema: {
+          template_id: z.string().optional(),
+          thread_id: z.string().optional(),
+          limit: z.number().int().optional(),
+        },
+      },
+      async (
+        args: { template_id?: string; thread_id?: string; limit?: number },
+        eff,
+      ) => writeContent(await issuedDocumentList(eff, args)),
+    );
   }
 
   if (hasScope(principal, "mcp:write")) {
@@ -1088,49 +1284,15 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_settings_set",
       {
         description:
-          "Patch an agent's BEHAVIOR config. Each block is a PARTIAL patch MERGED into the existing settings (untouched keys preserved) and re-validated/clamped by the runtime readers. Previews a normalized diff and applies NOTHING unless dry_run is false. credentialRef accepts a vault entry NAME or a stable vault:<id> ref (use vault:<id> when several entries share a name). What each block DOES, and what it costs, is in docs/ (tts, stt, split, service-window, channel-redirect, graph, logs, chatwoot) \u2014 here is the shape to send and the rules that refuse a call. debounce: {enabled,windowSeconds,maxMessagesPerBurst,maxWindowSeconds}. stt: {enabled,provider,model,language,credentialRef,baseURL}. tts: {mode(never|mirror|preference),provider,model,voice,credentialRef,normalize(bool),normalizeProvider,normalizeModel,normalizeCredentialRef,normalizeBaseURL,stability(0-1),similarityBoost(0-1),style(0-1),speed(0.25-4),speakerBoost(bool)} \u2014 the five knobs are FLAT on the block and clamped on write; null/omitted leaves each to the voice's own saved setting. vision: {enabled,provider(openai|gemini|anthropic),model,credentialRef,baseURL,extractionPrompt}. split: {enabled,maxChars,typingWpm,minDelayMs,maxDelayMs,maxChunks}. serviceWindow: {enabled,windowHours,templateName,templateLanguage,templateCategory,templateParams,templateContent}. grounding: {maxDistance}. followUp: {enabled,pauseWhileAppointment,steps:[{delayValue,delayUnit(minutes|hours|days),instructions,assignLabels?,resolve?(last step only)}]}. handoff: {mode(route|pinned|agent_choice),targetAgentId?,targetTeamId?,targetInstanceId?,instructions?}. limits: {maxToolCalls(1-50, default 10), maxHistoryTokens(2000-1000000, null/0/absent = OFF)}. attributeContext: {conversation:[keys],contact:[keys],task:[keys]} \u2014 Chatwoot attribute KEYS per scope, max 20 each; empty arrays disable the block. sendImage: {allowedHosts:[hostnames, one per entry, \"*.\" prefix covers a domain and its subdomains]} \u2014 the fence for send_image; empty refuses every call. availability: {enabled(bool, default false), awayMessage} \u2014 the copy the CUSTOMER receives outside the schedule, at most once per local day per conversation; {proximo_atendimento} / {next_open} interpolate the next opening in the placeholder's own language, and copy carrying one is WITHHELD when the schedule never reopens. channelRedirect: {enabled,entryInboxId,widgetInboxId,redirectMessage(with {link}),resendDelayValue,resendDelayUnit(minutes|hours|days),maxResends,openWidget,cloneWaMessage,chatFollowupEnabled,chatFollowupDelayValue,chatFollowupDelayUnit,chatFollowupInstructions,waFollowupEnabled,waFollowupDelayValue,waFollowupDelayUnit,waFollowupMessage(with {link}),closingEnabled,closingDelayValue,closingDelayUnit,closingMessage} \u2014 widgetInboxId is provisioned via the console, not set by hand. observability: {logToolValues(bool, default false)}. memory: {compaction:{enabled(bool, default TRUE)}}. REFUSED, as opposed to clamped: operator free text over its cap is refused, not trimmed, on the preview as well as the apply \u2014 handoff.instructions 1500, followUp step instructions 2000, vision.extractionPrompt 4000. SAVED BUT DEAD, as opposed to refused: a tts block that ends up carrying normalizeModel or normalizeCredentialRef with no normalizeProvider (even the agent's own value) is stored without complaint and the rewrite NEVER RUNS \u2014 a model id and a key belong to the vendor they were picked from, so name it. (Appointment reminders live on the Calendar integration's config \u2014 see integration_update.)",
+          "Patch an agent's BEHAVIOR config. Each block is a PARTIAL patch MERGED into the existing settings (untouched keys preserved) and re-validated by the runtime readers, which CLAMP rather than refuse: a number outside its band is stored at the nearest end, and a value they cannot use at all is stored as the block's default. Previews a normalized diff and applies NOTHING unless dry_run is false \u2014 read the diff, it is where a clamp becomes visible. credentialRef accepts a vault entry NAME or a stable vault:<id> ref (use vault:<id> when several entries share a name). The fields, choices and ranges of every block are in this tool's SCHEMA; what each block does, and what it costs, is in docs/ (tts, stt, split, service-window, channel-redirect, graph, logs, chatwoot). Here are only the rules a caller cannot get from either. REFUSED, as opposed to clamped: operator free text over its cap is refused, not trimmed, on the preview as well as the apply \u2014 handoff.instructions 1500, followUp step instructions 2000, availability.awayMessage 2000, vision.extractionPrompt 4000. Only text this write INTRODUCES or CHANGES, so re-sending a stored over-cap value untouched is not a refusal. SAVED BUT DEAD, as opposed to refused: a tts block that ends up carrying normalizeModel or normalizeCredentialRef with no normalizeProvider (even the agent's own value) is stored without complaint and the rewrite NEVER RUNS \u2014 a model id and a key belong to the vendor they were picked from, so name it. On memory.compaction that same mistake, or a provider other than the agent's with no credentialRef of its own, stops the SUMMARISER instead and the thread stays raw. Same shape: an availability.awayMessage carrying {proximo_atendimento}/{next_open} is WITHHELD ENTIRELY when the schedule never reopens, because there is no honest value to interpolate. (Appointment reminders live on the Calendar integration's config \u2014 see integration_update.)",
         inputSchema: {
           agent_id: z.string(),
-          debounce: z.record(z.string(), z.unknown()).optional(),
-          stt: z.record(z.string(), z.unknown()).optional(),
-          tts: z.record(z.string(), z.unknown()).optional(),
-          vision: z.record(z.string(), z.unknown()).optional(),
-          split: z.record(z.string(), z.unknown()).optional(),
-          serviceWindow: z.record(z.string(), z.unknown()).optional(),
-          grounding: z.record(z.string(), z.unknown()).optional(),
-          followUp: z.record(z.string(), z.unknown()).optional(),
-          handoff: z.record(z.string(), z.unknown()).optional(),
-          limits: z.record(z.string(), z.unknown()).optional(),
-          availability: z.record(z.string(), z.unknown()).optional(),
-          channelRedirect: z.record(z.string(), z.unknown()).optional(),
-          attributeContext: z.record(z.string(), z.unknown()).optional(),
-          sendImage: z.record(z.string(), z.unknown()).optional(),
-          observability: z.record(z.string(), z.unknown()).optional(),
-          memory: z.record(z.string(), z.unknown()).optional(),
+          ...BEHAVIOR_PATCH_SHAPE,
           dry_run: z.boolean().optional(),
         },
       },
       async (
-        args: {
-          agent_id: string;
-          debounce?: Record<string, unknown>;
-          stt?: Record<string, unknown>;
-          tts?: Record<string, unknown>;
-          vision?: Record<string, unknown>;
-          split?: Record<string, unknown>;
-          serviceWindow?: Record<string, unknown>;
-          grounding?: Record<string, unknown>;
-          followUp?: Record<string, unknown>;
-          handoff?: Record<string, unknown>;
-          limits?: Record<string, unknown>;
-          availability?: Record<string, unknown>;
-          channelRedirect?: Record<string, unknown>;
-          attributeContext?: Record<string, unknown>;
-          sendImage?: Record<string, unknown>;
-          observability?: Record<string, unknown>;
-          memory?: Record<string, unknown>;
-          dry_run?: boolean;
-        },
+        args: BehaviorPatchArgs & { agent_id: string; dry_run?: boolean },
         eff,
       ) => writeContent(await agentSettingsSet(eff, args)),
     );
@@ -1309,15 +1471,23 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_tools_set",
       {
         description:
-          "REPLACE an agent's entire set of tool grants (it is not additive — pass the full desired set). Discover ids via agent_tools_get. Each grant has a source (NATIVE/RAG/HTTP/MCP/INTEGRATION) and the matching id(s): toolDefinitionId (HTTP), mcpServerConnectionId (MCP), integrationInstanceId (INTEGRATION), knowledgeBaseIds (RAG), enabledTools (names to enable within the source). For a RAG grant, omitting enabledTools defaults to search_knowledge (the knowledge base would otherwise be granted but unreachable). Previews current vs next and applies NOTHING unless dry_run is false.",
+          "REPLACE an agent's entire set of tool grants (it is not additive — pass the full desired set). Discover ids via agent_tools_get. Each grant has a source (NATIVE/RAG/HTTP/MCP/INTEGRATION/DOCUMENT) and the matching id(s): toolDefinitionId (HTTP), mcpServerConnectionId (MCP), integrationInstanceId (INTEGRATION), documentTemplateId (DOCUMENT), knowledgeBaseIds (RAG), enabledTools (names to enable within the source). For a RAG grant, omitting enabledTools defaults to search_knowledge (the knowledge base would otherwise be granted but unreachable). Previews current vs next and applies NOTHING unless dry_run is false.",
         inputSchema: {
           agent_id: z.string(),
           grants: z.array(
             z.object({
-              source: z.enum(["NATIVE", "RAG", "HTTP", "MCP", "INTEGRATION"]),
+              source: z.enum([
+                "NATIVE",
+                "RAG",
+                "HTTP",
+                "MCP",
+                "INTEGRATION",
+                "DOCUMENT",
+              ]),
               toolDefinitionId: z.string().nullable().optional(),
               mcpServerConnectionId: z.string().nullable().optional(),
               integrationInstanceId: z.string().nullable().optional(),
+              documentTemplateId: z.string().nullable().optional(),
               knowledgeBaseIds: z.array(z.string()).optional(),
               enabledTools: z.array(z.string()).optional(),
             }),
@@ -1333,6 +1503,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
             toolDefinitionId?: string | null;
             mcpServerConnectionId?: string | null;
             integrationInstanceId?: string | null;
+            documentTemplateId?: string | null;
             knowledgeBaseIds?: string[];
             enabledTools?: string[];
           }>;
@@ -1467,6 +1638,73 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       },
       async (args: { tool_id: string; dry_run?: boolean }, eff) =>
         writeContent(await toolDelete(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_create",
+      {
+        description:
+          'Create a document template (quote, proposal, receipt, service order) that an agent can issue and attach to a reply. Previews by RENDERING the document and creates NOTHING unless dry_run is false. Call document_template_schema first for the exact shape of blocks/fields/style; a property outside it is REFUSED by name, never ignored — this description carries only what that cannot tell you. Pass `starter` ("quote"|"proposal"|"receipt", see document_starters_list) to begin from a ready-made template and override what you need; that is the cheapest way in. `blocks` lays the document out (header, text, fields, lineItems, totals, divider); `fields` declares what the AGENT fills at issue time, and becomes the argument list of the tool that agent gets. Rules that REFUSE the call: a field name may not start with company_, empresa_, doc_ or documento_ (those already resolve to the letterhead or to the document itself); a lineItems or totals block may only point at a field of type lineItems; and any {{token}} naming neither a declared field nor a reserved name is refused, because it would render as a blank space in a document the customer keeps. totals computes its own arithmetic from the line items — never ask a model for a sum, and never declare a field to hold one. Text blocks take **bold**, *italic* and "- " bullets and nothing else; anything richer renders as its own source. The letterhead (name, tax id, address, logo) comes from the tenant company profile, not from here.',
+        inputSchema: {
+          name: z.string().optional(),
+          slug: z.string().optional(),
+          description: z.string().nullable().optional(),
+          blocks: z.array(z.record(z.string(), z.unknown())).optional(),
+          fields: z.array(z.record(z.string(), z.unknown())).optional(),
+          style: z.record(z.string(), z.unknown()).optional(),
+          number_prefix: z.string().nullable().optional(),
+          enabled: z.boolean().optional(),
+          starter: z.string().optional(),
+          locale: z.enum(["pt-BR", "en-US"]).optional(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: DocumentTemplateWriteArgs, eff) =>
+        writeContent(await documentTemplateCreate(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_update",
+      {
+        description:
+          "Patch a document template; omitted fields keep their value. blocks/fields/style take the shapes document_template_schema publishes, and sending either blocks or fields re-validates BOTH — half the rules are about how the two refer to each other. Previews by rendering the result and changes NOTHING unless dry_run is false.",
+        inputSchema: {
+          document_template_id: z.string(),
+          name: z.string().optional(),
+          slug: z.string().optional(),
+          description: z.string().nullable().optional(),
+          blocks: z.array(z.record(z.string(), z.unknown())).optional(),
+          fields: z.array(z.record(z.string(), z.unknown())).optional(),
+          style: z.record(z.string(), z.unknown()).optional(),
+          number_prefix: z.string().nullable().optional(),
+          enabled: z.boolean().optional(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (
+        args: DocumentTemplateWriteArgs & { document_template_id: string },
+        eff,
+      ) => writeContent(await documentTemplateUpdate(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_delete",
+      {
+        description:
+          "Delete a document template. Previews the target and deletes NOTHING unless dry_run is false. Documents already issued from it keep their own frozen copy and stay readable.",
+        inputSchema: {
+          document_template_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: { document_template_id: string; dry_run?: boolean }, eff) =>
+        writeContent(await documentTemplateDelete(eff, args)),
     );
 
     registerTenantTool(
@@ -1609,6 +1847,22 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
     registerTenantTool(
       server,
       principal,
+      "inbox_remove",
+      {
+        description:
+          "Remove the LOCAL mirror of an inbox that was deleted in Chatwoot. Refused while the inbox still exists there. Previews whether Chatwoot says it is gone and applies NOTHING unless dry_run is false.",
+        inputSchema: {
+          inbox_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: { inbox_id: string; dry_run?: boolean }, eff) =>
+        writeContent(await inboxRemove(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
       "inbox_reconnect",
       {
         description:
@@ -1707,6 +1961,22 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       },
       async (args: { webhook_id: string; dry_run?: boolean }, eff) =>
         writeContent(await webhookDelete(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "webhook_delivery_requeue",
+      {
+        description:
+          "Put a DEAD outbound webhook delivery back in the worker queue: status returns to PENDING and attempts resets to 0, so the full retry ladder runs again. Only DEAD is accepted — any other status is refused, naming it. Previews the row and changes NOTHING unless dry_run is false.",
+        inputSchema: {
+          delivery_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: { delivery_id: string; dry_run?: boolean }, eff) =>
+        writeContent(await webhookDeliveryRequeue(eff, args)),
     );
 
     registerTenantTool(

@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -13,6 +14,20 @@ import {
   listBusinessHours,
   updateBusinessHours,
 } from "@/modules/business-hours/service";
+
+// The error catalog this controller's routes answer with. `bun i18n:extract` materialises
+// src/api/locales/*.json from these lines and prunes anything nothing references, and
+// `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
+// throw site rather than an English sentence on a pt-BR caller's screen.
+// translate('errors.businessHoursNotFound', 'Business hours not found.')
+// NOTE: one key per refusal, not one per validator. The three exception checks refuse three
+// different things and each names the date or the range it refused, because the operator is
+// looking at a form with several of them and a sentence that does not say WHICH is not an answer.
+// translate('errors.invalidBusinessHoursDate', '{{date}} is not a calendar date.')
+// translate('errors.invalidBusinessHoursRange', 'The range on {{date}} must end after it starts ({{start}} to {{end}}).')
+// translate('errors.invalidBusinessHoursSpan', 'The exception starting {{start}} must not end before it ({{end}}).')
+// translate('errors.invalidBusinessHoursWindow', 'The window for day {{day}} must end after it starts ({{start}} to {{end}}).')
+// translate('errors.invalidTimezone', 'Unknown timezone: {{timezone}}.')
 
 // Business-hours schedules (per-tenant). TENANT_ADMIN.
 
@@ -99,6 +114,22 @@ const writeBody = t.Object({
   ),
 });
 
+// The CREATE route's own body. `writeBody` above describes what a PATCH accepts, where every field
+// being optional is correct, and a POST that borrows it lets a request missing a required field
+// through the transport: the refusal then comes from the service's zod schema, whose `ZodError`
+// src/app.ts has no branch for, so the caller is told the server broke about a field they own
+// (issue #301, measured: `POST` with `{}` answered 500 `Something went wrong`).
+//
+// Composed rather than written out, so the descriptions and the field list stay in one place and a
+// field added to `writeBody` cannot be missing here. WHICH fields are required is not written twice
+// either: tests/api/v1/write-body-required.test.ts derives that set from the service's create schema
+// and fails if the two drift.
+const CREATE_REQUIRED = ["name"] as const;
+const createBody = t.Composite([
+  t.Omit(writeBody, CREATE_REQUIRED),
+  t.Required(t.Pick(writeBody, CREATE_REQUIRED)),
+]);
+
 export const businessHoursController = new Elysia({
   prefix: "/v1/business-hours",
   tags: ["Resources"],
@@ -116,7 +147,7 @@ export const businessHoursController = new Elysia({
         "List business hours",
         "List all business-hours schedules for the current tenant.",
       ),
-      response: errors(401, 403),
+      response: errors(401, 403, 404),
     },
   )
   .get(
@@ -125,7 +156,7 @@ export const businessHoursController = new Elysia({
       instance: instanceIdentity,
       businessHours: await getBusinessHours(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -157,8 +188,8 @@ export const businessHoursController = new Elysia({
         "Create business hours",
         "Create a new business-hours schedule for the current tenant.",
       ),
-      response: errors(400, 401, 403),
-      body: writeBody,
+      response: errors(400, 401, 403, 404, 422),
+      body: createBody,
     },
   )
   .patch(
@@ -167,7 +198,7 @@ export const businessHoursController = new Elysia({
       instance: instanceIdentity,
       businessHours: await updateBusinessHours(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body as BusinessHoursUpdate,
       ),
     }),
@@ -177,7 +208,7 @@ export const businessHoursController = new Elysia({
         "Update business hours",
         "Update a business-hours schedule name, timezone, or windows.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({
           description: "Business-hours schedule id (BigInt as a string).",
@@ -189,7 +220,10 @@ export const businessHoursController = new Elysia({
   .delete(
     "/:id",
     async ({ tenantContext, params }) => {
-      await deleteBusinessHours(ctxOrThrow(tenantContext), BigInt(params.id));
+      await deleteBusinessHours(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      );
       return { instance: instanceIdentity, success: true };
     },
     {

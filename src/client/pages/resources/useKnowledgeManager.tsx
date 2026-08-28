@@ -32,9 +32,11 @@ import {
   useToast,
 } from "@/client/components";
 import { Tooltip } from "@/client/components/Tooltip";
+import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
-import { mergeDocumentEvent } from "@/client/lib/knowledgeDocs";
+import { apiErrorMessage } from "@/client/lib/apiError";
+import { docErrorEntry, mergeDocumentEvent } from "@/client/lib/knowledgeDocs";
 import { cn } from "@/client/lib/utils";
 
 type BasesData = Awaited<
@@ -75,6 +77,7 @@ interface PickedFile {
   status: UploadStatus;
   // HTTP status of the failed upload (set when status === "error"); 0 for a thrown/network error.
   errorStatus?: number;
+  errorMessage?: string;
 }
 
 // Run `worker` over `items` with at most `limit` in flight (bounded concurrency for batch uploads,
@@ -114,6 +117,15 @@ export interface KnowledgeManager {
 // Knowledge panel and the agent editor's Knowledge tab so a base can be created/edited/fed documents
 // without leaving the agent. `onChanged` is called after any mutation so the consumer refetches its
 // own list (the bases list itself is NOT owned here — each consumer renders its own).
+// The keys of the bodies these forms write, spelled the way the routes refuse them.
+const BASE_FIELDS = [
+  "name",
+  "description",
+  "chunkSize",
+  "chunkOverlap",
+] as const;
+const DOC_FIELDS = ["title", "text"] as const;
+
 export function useKnowledgeManager(opts: {
   onChanged: () => void | Promise<void>;
   // Optional: called with the freshly-created base so a caller (the agent editor) can auto-select it.
@@ -127,8 +139,8 @@ export function useKnowledgeManager(opts: {
   const onChanged = opts.onChanged;
 
   const ADD_TABS: TabItem[] = [
-    { key: "texto", label: t("knowledge.tabTexto", "Texto") },
-    { key: "arquivo", label: t("knowledge.tabArquivo", "Arquivo") },
+    { key: "texto", label: t("knowledge.tabTexto", "Text") },
+    { key: "arquivo", label: t("knowledge.tabArquivo", "File") },
   ];
 
   const createModal = useModalController();
@@ -141,7 +153,22 @@ export function useKnowledgeManager(opts: {
   const docEditModal = useModalController<{ id: string; title: string }>();
   const confirm = useModalController<ConfirmPayload>();
 
+  // Above the holders because one of them reads it: the add dialog's tab decides whether the text
+  // box is on screen at all.
+  const [addTab, setAddTab] = useState("texto");
+
   // Create/edit KB fields
+  // Three forms here, three holders: the base (create and edit share their inputs and are never open
+  // together), the "add text" document, and the document editor.
+  const baseRefusal = useFieldRefusal(
+    createModal.isOpen || editModal.isOpen ? BASE_FIELDS : [],
+  );
+  // The add dialog has two tabs and the text box belongs to one of them: on the file tab there is no
+  // control for `title` or `text`, so a refusal naming either has to go to the toast.
+  const addDocRefusal = useFieldRefusal(
+    addContentModal.isOpen && addTab === "texto" ? DOC_FIELDS : [],
+  );
+  const editDocRefusal = useFieldRefusal(docEditModal.isOpen ? DOC_FIELDS : []);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [chunkSize, setChunkSize] = useState(1000);
@@ -150,8 +177,11 @@ export function useKnowledgeManager(opts: {
   const [chunkOverlapError, setChunkOverlapError] = useState("");
 
   // Add content fields (the add form is a modal stacked over the documents list).
-  const [addTab, setAddTab] = useState("texto");
   const [docTitle, setDocTitle] = useState("");
+  // What each form's inputs hold right now, readable from inside a request that started before them.
+  const baseRef = useRef<Record<string, unknown>>({});
+  const editDocRef = useRef<Record<string, unknown>>({});
+  const addDocRef = useRef<Record<string, unknown>>({});
   const [text, setText] = useState("");
   const [picked, setPicked] = useState<PickedFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -204,6 +234,17 @@ export function useKnowledgeManager(opts: {
   // Doc edit (title + text); the text loads from the GET-by-id, then a PATCH re-ingests on change.
   const [editDocTitle, setEditDocTitle] = useState("");
   const [editDocText, setEditDocText] = useState("");
+  baseRef.current = {
+    name: name.trim(),
+    description: description.trim(),
+    chunkSize,
+    chunkOverlap,
+  };
+  editDocRef.current = { title: editDocTitle.trim(), text: editDocText };
+  addDocRef.current = {
+    title: docTitle.trim() || t("knowledge.docTitle", "Title"),
+    text: text.trim(),
+  };
   const [editDocLoading, setEditDocLoading] = useState(false);
   const [editDocOriginal, setEditDocOriginal] = useState({
     title: "",
@@ -332,6 +373,8 @@ export function useKnowledgeManager(opts: {
   }
 
   useOnModalOpen(createModal, () => {
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    baseRefusal.clear();
     setName("");
     setDescription("");
     setChunkSize(1000);
@@ -341,6 +384,8 @@ export function useKnowledgeManager(opts: {
   });
 
   useOnModalOpen(editModal, () => {
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    baseRefusal.clear();
     const b = editModal.payload;
     if (!b) return;
     setName(b.name);
@@ -352,6 +397,8 @@ export function useKnowledgeManager(opts: {
   });
 
   useOnModalOpen(addContentModal, () => {
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    addDocRefusal.clear();
     setAddTab("texto");
     setDocTitle("");
     setText("");
@@ -380,6 +427,8 @@ export function useKnowledgeManager(opts: {
   });
 
   useOnModalOpen(docEditModal, () => {
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    editDocRefusal.clear();
     const payload = docEditModal.payload;
     if (!payload) return;
     setEditDocTitle(payload.title);
@@ -441,6 +490,7 @@ export function useKnowledgeManager(opts: {
         description: description.trim() || undefined,
       });
       if (err || !data) throw err;
+      baseRefusal.clear();
       if (chunkSize !== 1000 || chunkOverlap !== 200) {
         await api.api.v1.knowledge
           .bases({ id: data.base.id })
@@ -450,8 +500,14 @@ export function useKnowledgeManager(opts: {
       createModal.close();
       void onChanged();
       opts.onCreated?.({ id: data.base.id, name: name.trim() });
-    } catch {
-      showToast(t("knowledge.createError", "Could not create."), "error");
+    } catch (e) {
+      const toast = baseRefusal.capture(
+        e,
+        t("knowledge.createError", "Could not create."),
+        { name: name.trim(), description: description.trim() || undefined },
+        baseRef.current,
+      );
+      if (toast) showToast(toast, "error");
     } finally {
       setBusy(false);
     }
@@ -472,11 +528,23 @@ export function useKnowledgeManager(opts: {
           chunkOverlap,
         });
       if (err) throw err;
+      baseRefusal.clear();
       showToast(t("knowledge.updated", "Knowledge base updated."), "success");
       editModal.close();
       void onChanged();
-    } catch {
-      showToast(t("knowledge.updateError", "Could not update."), "error");
+    } catch (e) {
+      const toast = baseRefusal.capture(
+        e,
+        t("knowledge.updateError", "Could not update."),
+        {
+          name: name.trim(),
+          description: description.trim() || null,
+          chunkSize,
+          chunkOverlap,
+        },
+        baseRef.current,
+      );
+      if (toast) showToast(toast, "error");
     } finally {
       setBusy(false);
     }
@@ -487,13 +555,15 @@ export function useKnowledgeManager(opts: {
     if (!payload || !text.trim()) return;
     setBusy(true);
     try {
+      const sent = {
+        title: docTitle.trim() || t("knowledge.docTitle", "Title"),
+        text: text.trim(),
+      };
       const { error: err } = await api.api.v1.knowledge
         .bases({ id: payload.id })
-        .documents.post({
-          title: docTitle.trim() || t("knowledge.docTitle", "Title"),
-          text: text.trim(),
-        });
+        .documents.post(sent);
       if (err) throw err;
+      addDocRefusal.clear();
       showToast(
         t("knowledge.addedQueued", "Document queued for processing."),
         "success",
@@ -503,15 +573,32 @@ export function useKnowledgeManager(opts: {
       addContentModal.close();
       if (docsModal.payload) await reloadDocs(docsModal.payload.id);
       void onChanged();
-    } catch {
-      showToast(t("knowledge.addError", "Could not add document."), "error");
+    } catch (e) {
+      // The server's own message when it sent one: a refusal that names the field and the character
+      // is the whole answer, and collapsing it into "Could not add document" throws away the only
+      // part the operator can act on (issue #247) — at the input it named, when this form draws one.
+      const toast = addDocRefusal.capture(
+        e,
+        t("knowledge.addError", "Could not add document."),
+        {
+          title: docTitle.trim() || t("knowledge.docTitle", "Title"),
+          text: text.trim(),
+        },
+        addDocRef.current,
+      );
+      if (toast) showToast(toast, "error");
     } finally {
       setBusy(false);
     }
   }
 
-  // Localized failure reason for a per-file upload error (static keys: extractor-friendly).
-  function uploadErrorMessage(status: number | undefined): string {
+  // Localized failure reason for a per-file upload error (static keys: extractor-friendly). The
+  // server's own message wins when it sent one: the statuses below are the ones we can phrase better
+  // than the API can, and everything else the API already phrased for this operator's language.
+  function uploadErrorMessage(
+    status: number | undefined,
+    message: string | undefined,
+  ): string {
     if (status === 422) {
       return t(
         "knowledge.fileNotExtractable",
@@ -524,7 +611,7 @@ export function useKnowledgeManager(opts: {
     if (status === 413) {
       return t("knowledge.fileTooLarge", "The file exceeds the size limit.");
     }
-    return t("knowledge.addError", "Could not add document.");
+    return message ?? t("knowledge.addError", "Could not add document.");
   }
 
   // Upload one staged file, returning the failing HTTP status (undefined on success, 0 on a thrown
@@ -534,7 +621,7 @@ export function useKnowledgeManager(opts: {
     baseId: string,
     pf: PickedFile,
     useTitle: boolean,
-  ): Promise<number | undefined> {
+  ): Promise<{ status: number; message?: string } | undefined> {
     try {
       // NOTE: the treaty serializes a File body as multipart AND injects the
       // X-Tenant-Id header (SUPER_ADMIN target tenant); a raw fetch here 500s
@@ -545,9 +632,11 @@ export function useKnowledgeManager(opts: {
           file: pf.file,
           ...(useTitle && docTitle.trim() ? { title: docTitle.trim() } : {}),
         });
-      return err ? err.status : undefined;
+      return err
+        ? { status: err.status, message: apiErrorMessage(err) ?? undefined }
+        : undefined;
     } catch {
-      return 0;
+      return { status: 0 };
     }
   }
 
@@ -567,17 +656,21 @@ export function useKnowledgeManager(opts: {
           : { ...p, status: "uploading", errorKey: undefined },
       ),
     );
-    const results = new Map<string, number | undefined>();
+    const results = new Map<
+      string,
+      { status: number; message?: string } | undefined
+    >();
     await runPool(toUpload, 3, async (pf) => {
-      const errorStatus = await uploadOne(payload.id, pf, useTitle);
-      results.set(pf.id, errorStatus);
+      const failure = await uploadOne(payload.id, pf, useTitle);
+      results.set(pf.id, failure);
       setPicked((prev) =>
         prev.map((p) =>
           p.id === pf.id
             ? {
                 ...p,
-                status: errorStatus === undefined ? "done" : "error",
-                errorStatus,
+                status: failure === undefined ? "done" : "error",
+                errorStatus: failure?.status,
+                errorMessage: failure?.message,
               }
             : p,
         ),
@@ -652,15 +745,19 @@ export function useKnowledgeManager(opts: {
         .documents({ id: payload.id })
         .patch({ title: editDocTitle.trim(), text: editDocText });
       if (err) throw err;
+      editDocRefusal.clear();
       showToast(t("knowledge.docUpdated", "Document updated."), "success");
       docEditModal.close();
       if (docsModal.payload) await reloadDocs(docsModal.payload.id);
       void onChanged();
-    } catch {
-      showToast(
+    } catch (e) {
+      const toast = editDocRefusal.capture(
+        e,
         t("knowledge.docUpdateError", "Could not update the document."),
-        "error",
+        { title: editDocTitle.trim(), text: editDocText },
+        editDocRef.current,
       );
+      if (toast) showToast(toast, "error");
     } finally {
       setBusy(false);
     }
@@ -675,8 +772,12 @@ export function useKnowledgeManager(opts: {
       const base = data.bases.find((b) => b.id === id);
       if (!base) throw new Error("not found");
       editModal.open(base);
-    } catch {
-      showToast(t("knowledge.loadError", "Could not load this base."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("knowledge.loadError", "Could not load this base."),
+        "error",
+      );
     }
   }
 
@@ -700,13 +801,16 @@ export function useKnowledgeManager(opts: {
       // (e.g. the editor's "documents need indexing" banner) clear immediately.
       void onChanged();
       showToast(t("knowledge.retried", "Retrying..."), "success");
-    } catch {
+    } catch (e) {
       setDocs((prev) =>
         prev
           ? prev.map((d) => (d.id === doc.id ? { ...d, status: original } : d))
           : null,
       );
-      showToast(t("knowledge.retryError", "Could not retry."), "error");
+      showToast(
+        apiErrorMessage(e) || t("knowledge.retryError", "Could not retry."),
+        "error",
+      );
     }
   }
 
@@ -761,10 +865,11 @@ export function useKnowledgeManager(opts: {
       // (e.g. the editor's "documents need indexing" banner) clear immediately.
       void onChanged();
       showToast(t("knowledge.indexing", "Indexing…"), "success");
-    } catch {
+    } catch (e) {
       revert();
       showToast(
-        t("knowledge.indexAllError", "Could not start indexing."),
+        apiErrorMessage(e) ||
+          t("knowledge.indexAllError", "Could not start indexing."),
         "error",
       );
     }
@@ -784,7 +889,8 @@ export function useKnowledgeManager(opts: {
           .delete();
         if (err) {
           showToast(
-            t("knowledge.docDeleteError", "Could not delete document."),
+            apiErrorMessage(err) ||
+              t("knowledge.docDeleteError", "Could not delete document."),
             "error",
           );
           throw err;
@@ -811,7 +917,11 @@ export function useKnowledgeManager(opts: {
           .bases({ id: b.id })
           .delete();
         if (err) {
-          showToast(t("knowledge.deleteError", "Could not delete."), "error");
+          showToast(
+            apiErrorMessage(err) ||
+              t("knowledge.deleteError", "Could not delete."),
+            "error",
+          );
           throw err;
         }
         showToast(t("knowledge.deleted", "Deleted."), "success");
@@ -822,20 +932,19 @@ export function useKnowledgeManager(opts: {
 
   // Localizes a document's failure reason. The ingest job stores a stable i18n token for known
   // failures (e.g. a missing embedding credential); anything else is a raw diagnostic message.
+  //
+  // The branch table moved to src/client/lib/knowledgeDocs.ts, keyed on the SAME map the server
+  // throws from, because the two used to spell the tokens differently and neither branch ever fired
+  // (issue #256). Only the `t` call is left here: `t` is a hook binding this component owns.
+  //
+  // t('knowledge.docError.embeddingEmpty', 'The embedding credential is empty. Fill it in, then index again.')
+  // t('knowledge.docError.embeddingNotConfigured', 'The embedding credential is not configured for this workspace. Set it under Components, then index again.')
+  // t('knowledge.docError.embeddingPending', 'The embedding credential has not been filled in yet. Fill it in, then index again.')
   function docErrorText(error: string): string {
-    if (error === "errors.embeddingNotConfigured") {
-      return t(
-        "knowledge.docError.embeddingNotConfigured",
-        "The embedding credential is not configured for this workspace. Set it under Components, then index again.",
-      );
-    }
-    if (error === "errors.embeddingEmpty") {
-      return t(
-        "knowledge.docError.embeddingEmpty",
-        "The embedding credential is empty. Fill it in, then index again.",
-      );
-    }
-    return error;
+    const entry = docErrorEntry(error);
+    if (!entry) return error;
+    // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via the magic comments just above
+    return t(entry.key, entry.fallback);
   }
 
   // Operator-facing text for one block reason. The three need different instructions: create a
@@ -872,7 +981,7 @@ export function useKnowledgeManager(opts: {
     if (doc.status === "READY") {
       return (
         <span className="rounded-full bg-success/10 px-2 py-0.5 text-success text-xs">
-          {t("knowledge.docStatus.READY", "{{n}} trechos", {
+          {t("knowledge.docStatus.READY", "{{n}} chunks", {
             n: doc.chunkCount,
           })}
         </span>
@@ -986,23 +1095,35 @@ export function useKnowledgeManager(opts: {
         }
       >
         <div className="flex flex-col gap-4">
-          <FormField label={t("knowledge.name", "Name")} required>
+          <FormField
+            label={t("knowledge.name", "Name")}
+            required
+            error={baseRefusal.at("name", name.trim())}
+          >
             <Input value={name} onChange={(e) => setName(e.target.value)} />
           </FormField>
-          <FormField label={t("knowledge.description", "Description")}>
+          <FormField
+            label={t("knowledge.description", "Description")}
+            error={baseRefusal.at("description", description.trim())}
+          >
             <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={2}
             />
           </FormField>
+          {/* `||` and not `??`: these two hold "" when there is nothing wrong, so a nullish fallback
+              never reaches the refusal behind it. The local check tests BOUNDS only, and the schema
+              is `t.Integer` — a chunk size of 100.5 passes here and is refused there by name, which
+              is exactly the case that was landing on a reading nobody could reach. Local first
+              because it is about what the box holds now. */}
           <FormField
             label={t("knowledge.chunkSize", "Chunk size (chars)")}
             hint={t(
               "knowledge.chunkSizeHint",
               "Controls how large each indexed text chunk is. Smaller chunks give more precision; larger chunks preserve more context.",
             )}
-            error={chunkSizeError}
+            error={chunkSizeError || baseRefusal.at("chunkSize", chunkSize)}
           >
             <Input
               type="number"
@@ -1018,7 +1139,9 @@ export function useKnowledgeManager(opts: {
               "knowledge.chunkOverlapHint",
               "Number of characters shared between consecutive chunks. Helps preserve context across chunk boundaries.",
             )}
-            error={chunkOverlapError}
+            error={
+              chunkOverlapError || baseRefusal.at("chunkOverlap", chunkOverlap)
+            }
           >
             <Input
               type="number"
@@ -1046,10 +1169,17 @@ export function useKnowledgeManager(opts: {
         }
       >
         <div className="flex flex-col gap-4">
-          <FormField label={t("knowledge.name", "Name")} required>
+          <FormField
+            label={t("knowledge.name", "Name")}
+            required
+            error={baseRefusal.at("name", name.trim())}
+          >
             <Input value={name} onChange={(e) => setName(e.target.value)} />
           </FormField>
-          <FormField label={t("knowledge.description", "Description")}>
+          <FormField
+            label={t("knowledge.description", "Description")}
+            error={baseRefusal.at("description", description.trim())}
+          >
             <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -1062,7 +1192,7 @@ export function useKnowledgeManager(opts: {
               "knowledge.chunkSizeHint",
               "Controls how large each indexed text chunk is. Smaller chunks give more precision; larger chunks preserve more context.",
             )}
-            error={chunkSizeError}
+            error={chunkSizeError || baseRefusal.at("chunkSize", chunkSize)}
           >
             <Input
               type="number"
@@ -1078,7 +1208,9 @@ export function useKnowledgeManager(opts: {
               "knowledge.chunkOverlapHint",
               "Number of characters shared between consecutive chunks. Helps preserve context across chunk boundaries.",
             )}
-            error={chunkOverlapError}
+            error={
+              chunkOverlapError || baseRefusal.at("chunkOverlap", chunkOverlap)
+            }
           >
             <Input
               type="number"
@@ -1096,13 +1228,9 @@ export function useKnowledgeManager(opts: {
         modal={addContentModal}
         size="lg"
         unsavedChanges={addContentDirty}
-        title={t(
-          "knowledge.addContentTitle",
-          "Adicionar conteúdo em {{name}}",
-          {
-            name: addContentModal.payload?.name ?? "",
-          },
-        )}
+        title={t("knowledge.addContentTitle", "Add content to {{name}}", {
+          name: addContentModal.payload?.name ?? "",
+        })}
         footer={
           <div className="flex justify-end gap-2">
             <ModalCancelButton disabled={busy} />
@@ -1111,7 +1239,7 @@ export function useKnowledgeManager(opts: {
               loading={busy}
               disabled={!addContentValid}
             >
-              {t("knowledge.addContentAction", "Adicionar")}
+              {t("knowledge.addContentAction", "Add")}
             </Button>
           </div>
         }
@@ -1121,17 +1249,24 @@ export function useKnowledgeManager(opts: {
             items={ADD_TABS}
             value={addTab}
             onChange={setAddTab}
-            aria-label={t("knowledge.addContent", "Adicionar conteúdo")}
+            aria-label={t("knowledge.addContent", "Add content")}
           />
           {addTab === "texto" && (
             <div className="flex flex-col gap-4">
-              <FormField label={t("knowledge.docTitle", "Title")}>
+              <FormField
+                label={t("knowledge.docTitle", "Title")}
+                error={addDocRefusal.at("title", docTitle.trim())}
+              >
                 <Input
                   value={docTitle}
                   onChange={(e) => setDocTitle(e.target.value)}
                 />
               </FormField>
-              <FormField label={t("knowledge.text", "Text")} required>
+              <FormField
+                label={t("knowledge.text", "Text")}
+                required
+                error={addDocRefusal.at("text", text.trim())}
+              >
                 <Textarea
                   value={text}
                   onChange={(e) => setText(e.target.value)}
@@ -1210,7 +1345,7 @@ export function useKnowledgeManager(opts: {
                   >
                     {t(
                       "knowledge.dropHint",
-                      "Arraste e solte arquivos aqui, ou clique para escolher",
+                      "Drag and drop files here, or click to choose",
                     )}
                   </span>
                   <span className="text-text-muted text-xs">
@@ -1252,7 +1387,10 @@ export function useKnowledgeManager(opts: {
                       )}
                       {p.status === "error" && (
                         <Tooltip
-                          content={uploadErrorMessage(p.errorStatus)}
+                          content={uploadErrorMessage(
+                            p.errorStatus,
+                            p.errorMessage,
+                          )}
                           side="top"
                         >
                           <span className="shrink-0 cursor-help rounded-full bg-error/10 px-2 py-0.5 text-error text-xs">
@@ -1263,10 +1401,7 @@ export function useKnowledgeManager(opts: {
                       {(p.status === "idle" || p.status === "error") && (
                         <button
                           type="button"
-                          aria-label={t(
-                            "knowledge.clearFile",
-                            "Limpar arquivo",
-                          )}
+                          aria-label={t("knowledge.clearFile", "Clear file")}
                           onClick={() => removeFile(p.id)}
                           className="shrink-0 rounded p-0.5 text-text-muted transition-colors hover:text-text-primary"
                         >
@@ -1327,7 +1462,7 @@ export function useKnowledgeManager(opts: {
               }}
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
-              {t("knowledge.addContentAction", "Adicionar")}
+              {t("knowledge.addContentAction", "Add")}
             </Button>
           </div>
           {docs === null ? (
@@ -1534,7 +1669,11 @@ export function useKnowledgeManager(opts: {
           </div>
         ) : (
           <div className="flex flex-col gap-4">
-            <FormField label={t("knowledge.docTitleLabel", "Title")} required>
+            <FormField
+              label={t("knowledge.docTitleLabel", "Title")}
+              required
+              error={editDocRefusal.at("title", editDocTitle.trim())}
+            >
               <Input
                 value={editDocTitle}
                 onChange={(e) => setEditDocTitle(e.target.value)}
@@ -1547,6 +1686,7 @@ export function useKnowledgeManager(opts: {
                 "knowledge.docEditHint",
                 "Editing the content re-indexes the document (it is re-embedded).",
               )}
+              error={editDocRefusal.at("text", editDocText)}
             >
               <Textarea
                 value={editDocText}

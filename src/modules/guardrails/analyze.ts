@@ -1,3 +1,4 @@
+import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import {
   type BaseMessage,
@@ -11,6 +12,7 @@ import {
   customerMessageForReview,
   fenceCustomerMessage,
   type GuardrailPromptParams,
+  judgesAnything,
 } from "./prompts";
 import {
   type GuardrailVerdict,
@@ -64,8 +66,10 @@ export function splitAnalyses(p: AnalysisParams): {
     return { policies: p, relevance: null };
   }
   const otherChecks = { ...p.checks, answerRelevance: false };
-  const judgesTheReply =
-    Object.values(otherChecks).some(Boolean) || p.customPolicy.trim() !== "";
+  // Same question the gate asks before screening at all, from the same definition: whether a prompt
+  // built from these checks would list anything. Two copies of it would differ the day a check
+  // becomes direction-specific, and the copy that forgot would send an empty policy list.
+  const judgesTheReply = judgesAnything({ ...p, checks: otherChecks });
   return {
     policies: judgesTheReply
       ? { ...p, checks: otherChecks, customerMessage: undefined }
@@ -149,10 +153,18 @@ export async function analyzeGuardrail(
   // (`acceptsConstrainedOutput`), and passed rather than inferred here: the same adapter serves an
   // endpoint we own and one we know nothing about, so the instance cannot answer this.
   mode: VerdictMode,
+  // The turn's usage sink. A guardrail analysis is a billed model call like any other, and without
+  // this it is spent money with no row (issue #316) — the same hole the speech normalizer had.
+  callbacks?: BaseCallbackHandler[],
 ): Promise<GuardrailVerdict> {
   const { policies, relevance } = splitAnalyses(params);
   if (relevance === null) {
-    const verdict = await runAnalysis(model, policies as AnalysisParams, mode);
+    const verdict = await runAnalysis(
+      model,
+      policies as AnalysisParams,
+      mode,
+      callbacks,
+    );
     // NOTE: The INPUT direction never delivers a replacement. There is no assistant reply to repair
     // there — the analyzed text is the CUSTOMER's message — so "write a safe replacement" has no
     // referent and the model composes one from an empty desk. Measured live against eight models
@@ -183,12 +195,14 @@ export async function analyzeGuardrail(
     return params.direction === "input" ? withoutReplacement(verdict) : verdict;
   }
   if (policies === null) {
-    return withoutReplacement(await runAnalysis(model, relevance, mode));
+    return withoutReplacement(
+      await runAnalysis(model, relevance, mode, callbacks),
+    );
   }
   // NOTE: In parallel: the operator is paying for a turn a customer is waiting on.
   const [byPolicy, byRelevance] = await Promise.all([
-    runAnalysis(model, policies, mode),
-    runAnalysis(model, relevance, mode).then(withoutReplacement),
+    runAnalysis(model, policies, mode, callbacks),
+    runAnalysis(model, relevance, mode, callbacks).then(withoutReplacement),
   ]);
   // NOTE: A rewrite from the policy half PRESERVES the substance of the reply and repairs its form, which
   // is the whole reason it is allowed to write one. When relevance also tripped, the substance is
@@ -225,10 +239,12 @@ async function invokeForVerdict(
   model: BaseChatModel,
   mode: VerdictMode,
   messages: BaseMessage[],
+  callbacks?: BaseCallbackHandler[],
 ): Promise<{ parsed: Record<string, unknown> | null; raw: string }> {
   const asProse = async () => {
     const res = await model.invoke(messages, {
       signal: AbortSignal.timeout(ANALYZE_TIMEOUT_MS),
+      callbacks,
     });
     return { parsed: null, raw: messageText(res.content).trim() };
   };
@@ -251,6 +267,7 @@ async function invokeForVerdict(
       })
       .invoke(messages, {
         signal: AbortSignal.timeout(ANALYZE_TIMEOUT_MS),
+        callbacks,
       })) as {
       raw: BaseMessage;
       parsed: Record<string, unknown> | null;
@@ -273,6 +290,7 @@ async function runAnalysis(
   model: BaseChatModel,
   params: AnalysisParams,
   mode: VerdictMode,
+  callbacks?: BaseCallbackHandler[],
 ): Promise<GuardrailVerdict> {
   const system = buildGuardrailSystemPrompt(params);
   // NOTE: The customer's message rides at USER level, fenced and named, never inside the system prompt:
@@ -284,7 +302,7 @@ async function runAnalysis(
   messages.push(new HumanMessage(params.text));
   try {
     const { parsed, raw } = await runModelCall(() =>
-      invokeForVerdict(model, mode, messages),
+      invokeForVerdict(model, mode, messages, callbacks),
     );
     return readVerdict(parsed, raw);
   } catch (err) {

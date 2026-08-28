@@ -4,7 +4,7 @@ import { AppError, NotFoundError } from "@/lib/errors";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
-import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { readVaultRefId, tryResolveVaultEntry } from "@/modules/vault/service";
 
 // Lists the calendars a connected google_oauth credential can see, so the integration modal lets the
 // operator PICK which agendas the agent may operate on (instead of typing opaque calendar ids) and
@@ -77,22 +77,23 @@ export async function listCredentialCalendars(
       runScopedOn(base, ctx, (db) => tryResolveVaultEntry<unknown>(db, ref)));
   const entry = await resolveEntry(credentialRef);
   if (!entry)
-    throw new NotFoundError("Credential not found.", "errors.notFound");
+    throw new NotFoundError(
+      "Credential not found.",
+      "errors.googleCredentialNotFound",
+    );
   if (entry.kind !== "google_oauth") {
     throw new AppError(
       "Credential is not a connected Google account.",
       400,
-      "errors.badRequest",
+      "errors.googleCredentialNotConnected",
     );
   }
-  const entryId = credentialRef.startsWith("vault:")
-    ? BigInt(credentialRef.slice("vault:".length))
-    : null;
+  const entryId = readVaultRefId(credentialRef);
   if (entryId === null) {
     throw new AppError(
       "Invalid credential reference.",
       400,
-      "errors.badRequest",
+      "errors.invalidCredentialRef",
     );
   }
   const token = deps.resolveToken
@@ -130,7 +131,8 @@ export async function listCredentialCalendars(
     throw new AppError(
       `Google Calendar returned HTTP ${status}.`,
       502,
-      "errors.upstream",
+      "errors.integrationHttpError",
+      { provider: "Google Calendar", status },
     );
   }
   return mapCalendarListResponse(json);

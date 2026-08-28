@@ -1,12 +1,13 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
+import { parseDbId } from "@/lib/db-id";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
 import {
   cancelPendingJob,
   createDocument,
-  sysCtx as docsSysCtx,
+  refuseUnstorable,
   resolveEmbeddingConfig,
   validateChunkParams,
 } from "./documents";
@@ -21,12 +22,8 @@ import { type ChunkHit, searchChunks } from "./sql";
 //   - nothing enters a KB without human approval — the agent only proposes (ApprovalQueueItem);
 //   - approve uses CAS so a document is created exactly once.
 
-function sysCtx(tenantId: bigint): TenantContext {
-  return docsSysCtx(tenantId);
-}
-
 export interface SearchParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   query: string;
   knowledgeBaseIds?: bigint[];
   limit?: number;
@@ -38,11 +35,11 @@ export async function searchKnowledge(
   params: SearchParams,
 ): Promise<ChunkHit[]> {
   const base = params.base ?? basePrisma;
-  const tenantId = params.tenantId;
+  const { ctx } = params;
 
   // Phase 1 (scoped read): resolve the target KBs (RLS filters to tenant-owned) + embedding cfg.
   // All targeted KBs must share an embedding model (one vector space per search).
-  const prep = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  const prep = await runScopedOn(base, ctx, async (db) => {
     const kbs = await db.knowledgeBase.findMany({
       where: params.knowledgeBaseIds
         ? { id: { in: params.knowledgeBaseIds } }
@@ -59,7 +56,7 @@ export async function searchKnowledge(
     }
     const cfg = await resolveEmbeddingConfig(
       db,
-      tenantId,
+      ctx.tenantId as bigint,
       kbs[0]?.embeddingModel as string,
     );
     return { ids: kbs.map((k) => k.id), cfg };
@@ -70,7 +67,7 @@ export async function searchKnowledge(
   const queryEmbedding = await embedQuery(params.query, prep.cfg);
 
   // Phase 3 (scoped tx): KNN search (raw SQL, RLS-fenced).
-  return runScopedOn(base, sysCtx(tenantId), (db) =>
+  return runScopedOn(base, ctx, (db) =>
     searchChunks(db, {
       knowledgeBaseIds: prep.ids,
       queryEmbedding,
@@ -83,10 +80,10 @@ export async function searchKnowledge(
 // ── knowledge base CRUD ──
 
 export async function listKnowledgeBases(
-  tenantId: bigint,
+  ctx: TenantContext,
   base: PrismaClient = basePrisma,
 ) {
-  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+  return runScopedOn(base, ctx, async (db) => {
     const rows = await db.knowledgeBase.findMany({
       orderBy: { createdAt: "asc" },
       select: {
@@ -107,23 +104,32 @@ export async function listKnowledgeBases(
   });
 }
 
+// Every text this module stores is held to what its column can hold, at the core rather than at a
+// transport, because three roads reach these writes: REST, the MCP write tools, and the agent's own
+// suggestion tool. Refused rather than repaired: the writer here reads the answer and can send the
+// value again without the character. See rag/documents.ts for the full reasoning (issue #247).
 export async function createKnowledgeBase(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   name: string;
   description?: string;
   embeddingModel?: string;
   base?: PrismaClient;
 }): Promise<{ id: bigint }> {
   const base = params.base ?? basePrisma;
-  return runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  refuseUnstorable([
+    ["name", params.name],
+    ["description", params.description],
+    ["embeddingModel", params.embeddingModel],
+  ]);
+  return runScopedOn(base, params.ctx, async (db) => {
     // New bases inherit the tenant's default embedding model (so the tenant's one embedding config
     // applies uniformly) unless the caller pins one explicitly.
     const embeddingModel =
       params.embeddingModel ??
-      (await readEmbeddingSettings(db, params.tenantId)).model;
+      (await readEmbeddingSettings(db, params.ctx.tenantId as bigint)).model;
     const kb = await db.knowledgeBase.create({
       data: {
-        tenantId: params.tenantId,
+        tenantId: params.ctx.tenantId as bigint,
         name: params.name,
         description: params.description,
         embeddingModel,
@@ -137,7 +143,7 @@ export async function createKnowledgeBase(params: {
 // ── human approval queue ──
 
 export interface SuggestParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   knowledgeBaseId: bigint;
   proposedContent: string;
   proposedTitle?: string;
@@ -147,11 +153,24 @@ export interface SuggestParams {
   base?: PrismaClient;
 }
 
+// The same rule the document write applies (issue #247), asked one table earlier and of a different
+// writer: `proposedContent` and its siblings are `text` columns, and the agent's own suggestion tool
+// is what fills them, so the characters are a model's rather than a person's. A model reads a tool
+// failure and can write the fact again without them, so the answer is still a refusal.
 export async function createSuggestion(
   params: SuggestParams,
 ): Promise<{ id: bigint }> {
   const base = params.base ?? basePrisma;
-  return runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  // Labelled by the names the CALLER sends, not by the columns they land in: both roads here (the
+  // REST body and the agent's suggestion tool) spell these `title` / `content` / `rationale`, so a
+  // refusal naming `proposedContent` would tell a caller to fix a field they never sent (review
+  // round 3).
+  refuseUnstorable([
+    ["title", params.proposedTitle],
+    ["content", params.proposedContent],
+    ["rationale", params.rationale],
+  ]);
+  return runScopedOn(base, params.ctx, async (db) => {
     const kb = await db.knowledgeBase.findUnique({
       where: { id: params.knowledgeBaseId },
       select: { id: true },
@@ -159,7 +178,7 @@ export async function createSuggestion(
     if (!kb) throw new NotFoundError("knowledge base not found");
     const item = await db.approvalQueueItem.create({
       data: {
-        tenantId: params.tenantId,
+        tenantId: params.ctx.tenantId as bigint,
         knowledgeBaseId: params.knowledgeBaseId,
         proposedContent: params.proposedContent,
         proposedTitle: params.proposedTitle,
@@ -183,7 +202,10 @@ export type ApprovalSource =
   | { kind: "playground"; agentId: string; agentName: string | null }
   | null;
 
-function parseThreadOrigin(
+// Exported for its decision table (tests/modules/rag-thread-origin.test.ts). What it decides is
+// which id a stored thread key carries, and the key was written from a request body, so every
+// answer here is about a value a caller chose.
+export function parseThreadOrigin(
   threadId: string | null,
 ):
   | { kind: "conversation"; instanceId: bigint; displayId: number }
@@ -191,30 +213,30 @@ function parseThreadOrigin(
   | null {
   if (!threadId) return null;
   const parts = threadId.split(":");
-  try {
-    if (parts.length === 4 && parts[1] === "playground") {
-      return { kind: "playground", agentId: BigInt(parts[2] as string) };
-    }
-    if (parts.length === 3 && parts[1] !== "playground") {
-      const displayId = Number(parts[2]);
-      if (!Number.isInteger(displayId)) return null;
-      return {
-        kind: "conversation",
-        instanceId: BigInt(parts[1] as string),
-        displayId,
-      };
-    }
-  } catch {
-    return null;
+  // NOTE: `parseDbId`, and the `try` it replaces is why. This thread id was written from a REQUEST
+  // BODY and read back out of the approval row, so an id past 2^63-1 was stored once and then made
+  // every later read of the pending list answer 500 — a `catch` around `BigInt` never saw it,
+  // because that value converts. A thread id that carries no usable id has no origin. Issue #407.
+  if (parts.length === 4 && parts[1] === "playground") {
+    const agentId = parseDbId(parts[2]);
+    return agentId === null ? null : { kind: "playground", agentId };
+  }
+  if (parts.length === 3 && parts[1] !== "playground") {
+    const displayId = Number(parts[2]);
+    if (!Number.isInteger(displayId)) return null;
+    const instanceId = parseDbId(parts[1]);
+    return instanceId === null
+      ? null
+      : { kind: "conversation", instanceId, displayId };
   }
   return null;
 }
 
 export async function listPendingApprovals(
-  tenantId: bigint,
+  ctx: TenantContext,
   base: PrismaClient = basePrisma,
 ) {
-  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+  return runScopedOn(base, ctx, async (db) => {
     const items = await db.approvalQueueItem.findMany({
       where: { status: { in: ["PENDING", "EDITED"] } },
       orderBy: { createdAt: "asc" },
@@ -315,7 +337,7 @@ export async function listPendingApprovals(
 }
 
 export interface EditApprovalParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   id: bigint;
   proposedTitle?: string;
   proposedContent?: string;
@@ -329,13 +351,19 @@ export async function editApprovalItem(
   params: EditApprovalParams,
 ): Promise<"updated" | "not-pending"> {
   const base = params.base ?? basePrisma;
+  // The caller's names, as in createSuggestion above.
+  refuseUnstorable([
+    ["title", params.proposedTitle],
+    ["content", params.proposedContent],
+    ["rationale", params.rationale],
+  ]);
   const data: Record<string, unknown> = { status: "EDITED" };
   if (params.proposedTitle !== undefined)
     data.proposedTitle = params.proposedTitle;
   if (params.proposedContent !== undefined)
     data.proposedContent = params.proposedContent;
   if (params.rationale !== undefined) data.rationale = params.rationale;
-  return runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  return runScopedOn(base, params.ctx, async (db) => {
     const res = await db.approvalQueueItem.updateMany({
       where: { id: params.id, status: { in: ["PENDING", "EDITED"] } },
       data,
@@ -362,13 +390,13 @@ export interface ClaimedApproval {
 }
 
 export async function claimApprovalForStorage(
-  tenantId: bigint,
+  ctx: TenantContext,
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<ClaimedApproval | null> {
   const rows = await runScopedOn(
     base,
-    sysCtx(tenantId),
+    ctx,
     (db) =>
       db.$queryRaw<
         {
@@ -394,13 +422,13 @@ export async function claimApprovalForStorage(
 }
 
 export async function approveApprovalItem(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   id: bigint;
   demoMode?: boolean;
   base?: PrismaClient;
 }): Promise<ApproveResult> {
   const base = params.base ?? basePrisma;
-  const tenantId = params.tenantId;
+  const { ctx } = params;
 
   // Phase 1 (scoped read): does this item exist, is it still claimable, and does its base still
   // exist — the checks that decide WHETHER to claim.
@@ -410,7 +438,7 @@ export async function approveApprovalItem(params: {
   // read and the claim, the claim accepts it (EDITED is claimable) and the stale copy is what gets
   // embedded. Not reading it here is what makes that impossible to reintroduce — the only text in
   // scope is the one the claim itself returns.
-  const loaded = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  const loaded = await runScopedOn(base, ctx, async (db) => {
     const item = await db.approvalQueueItem.findUnique({
       where: { id: params.id },
       select: { id: true, status: true, knowledgeBaseId: true },
@@ -437,12 +465,12 @@ export async function approveApprovalItem(params: {
   // are told it worked and the un-revised text is what got embedded — precisely the outcome this
   // issue is about. `RETURNING` makes the claim and the read one operation, so whatever the row
   // holds at claim time is what is approved.
-  const claimed = await claimApprovalForStorage(tenantId, params.id, base);
+  const claimed = await claimApprovalForStorage(ctx, params.id, base);
   if (!claimed) return { outcome: "not-pending" };
 
   // Phase 3: Create a KnowledgeDocument and enqueue RAG_INGEST (or skip in demo mode).
   const doc = await createDocument({
-    tenantId,
+    ctx,
     knowledgeBaseId: claimed.knowledgeBaseId,
     title: claimed.proposedTitle ?? "Conteúdo aprovado",
     text: claimed.proposedContent,
@@ -452,25 +480,30 @@ export async function approveApprovalItem(params: {
 
   if (params.demoMode) {
     // NOTE: demo mode skips real embedding; document goes to READY with 0 chunks.
-    await runScopedOn(base, sysCtx(tenantId), (db) =>
+    await runScopedOn(base, ctx, (db) =>
       db.knowledgeDocument.updateMany({
         where: { id: doc.id, status: "PENDING" },
         data: { status: "READY", chunkCount: 0 },
       }),
     );
-    await cancelPendingJob(tenantId, "RAG_INGEST", `doc:${doc.id}`, base);
+    await cancelPendingJob(
+      ctx.tenantId as bigint,
+      "RAG_INGEST",
+      `doc:${doc.id}`,
+      base,
+    );
   }
 
   return { outcome: "approved", chunks: 0 };
 }
 
 export async function rejectApprovalItem(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   id: bigint;
   base?: PrismaClient;
 }): Promise<"rejected" | "not-pending"> {
   const base = params.base ?? basePrisma;
-  return runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  return runScopedOn(base, params.ctx, async (db) => {
     const res = await db.approvalQueueItem.updateMany({
       where: { id: params.id, status: { in: ["PENDING", "EDITED"] } },
       data: { status: "REJECTED" },
@@ -482,7 +515,7 @@ export async function rejectApprovalItem(params: {
 // ── knowledge base management ──
 
 export async function getKnowledgeBase(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   id: bigint;
   base?: PrismaClient;
 }): Promise<{
@@ -495,7 +528,7 @@ export async function getKnowledgeBase(params: {
   updatedAt: Date;
 }> {
   const base = params.base ?? basePrisma;
-  return runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  return runScopedOn(base, params.ctx, async (db) => {
     const kb = await db.knowledgeBase.findUnique({
       where: { id: params.id },
       select: {
@@ -521,7 +554,7 @@ export async function getKnowledgeBase(params: {
 }
 
 export async function updateKnowledgeBase(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   id: bigint;
   name?: string;
   description?: string | null;
@@ -530,6 +563,10 @@ export async function updateKnowledgeBase(params: {
   base?: PrismaClient;
 }): Promise<void> {
   const base = params.base ?? basePrisma;
+  refuseUnstorable([
+    ["name", params.name],
+    ["description", params.description],
+  ]);
 
   if (params.chunkSize !== undefined && params.chunkOverlap !== undefined) {
     validateChunkParams(params.chunkSize, params.chunkOverlap);
@@ -546,7 +583,7 @@ export async function updateKnowledgeBase(params: {
     }
   }
 
-  await runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  await runScopedOn(base, params.ctx, async (db) => {
     const res = await db.knowledgeBase.updateMany({
       where: { id: params.id },
       data: {
@@ -572,12 +609,12 @@ export async function updateKnowledgeBase(params: {
 }
 
 export async function deleteKnowledgeBase(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   id: bigint;
   base?: PrismaClient;
 }): Promise<void> {
   const base = params.base ?? basePrisma;
-  await runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  await runScopedOn(base, params.ctx, async (db) => {
     // KnowledgeChunk cascades via its FK to KnowledgeBase.
     const res = await db.knowledgeBase.deleteMany({ where: { id: params.id } });
     if (res.count === 0) {
@@ -590,7 +627,7 @@ export async function deleteKnowledgeBase(params: {
 }
 
 export async function listChunks(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   knowledgeBaseId: bigint;
   limit?: number;
   base?: PrismaClient;
@@ -598,7 +635,7 @@ export async function listChunks(params: {
   { id: bigint; content: string; metadata: unknown; createdAt: Date }[]
 > {
   const base = params.base ?? basePrisma;
-  return runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+  return runScopedOn(base, params.ctx, async (db) => {
     const kb = await db.knowledgeBase.findUnique({
       where: { id: params.knowledgeBaseId },
       select: { id: true },

@@ -1,6 +1,9 @@
+import { z } from "zod";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import { revokeApiKey } from "@/modules/api-keys/service";
+import { truncForAudit } from "@/modules/audit/projection";
 import {
   createBusinessHours,
   deleteBusinessHours,
@@ -12,6 +15,7 @@ import {
   deleteExperiment,
   getExperiment,
   updateExperiment,
+  variantWriteSchema,
 } from "@/modules/experiments/service";
 import {
   getTenantSettings,
@@ -31,9 +35,9 @@ import {
   err,
   gate,
   ok,
+  parseMcpId,
   recordMcpAudit,
   resolveSecretRef,
-  truncForAudit,
   type WriteDeps,
   type WriteResult,
 } from "./write";
@@ -48,14 +52,6 @@ function failOf(e: unknown): WriteResult {
   throw e;
 }
 
-function parseId(raw: string, label: string): bigint | WriteResult {
-  try {
-    return BigInt(raw);
-  } catch {
-    return err(`invalid ${label}`);
-  }
-}
-
 // ── A/B prompt experiments ──
 
 interface VariantArg {
@@ -64,12 +60,21 @@ interface VariantArg {
   system_prompt?: string;
 }
 
+// Mapped AND validated here, not only inside the service, because this runs on the DRY RUN too. The
+// service parses through `variantWriteSchema` on the way to the database, which a preview never
+// reaches — so a prompt past the ceiling came back as an approved preview and then failed on the
+// identical call with `dry_run: false`. A preview that approves what the write refuses is worse than
+// no preview: it is the one that gets trusted.
 function mapVariants(variants: VariantArg[]) {
-  return variants.map((v) => ({
-    key: v.key,
-    weight: v.weight,
-    systemPrompt: v.system_prompt,
-  }));
+  return parseInput(
+    z.array(variantWriteSchema),
+    variants.map((v) => ({
+      key: v.key,
+      weight: v.weight,
+      systemPrompt: v.system_prompt,
+    })),
+    "variants",
+  );
 }
 
 export async function experimentCreate(
@@ -86,10 +91,9 @@ export async function experimentCreate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
   let agentId: bigint | undefined;
   if (args.agent_id) {
-    const parsed = parseId(args.agent_id, "agent_id");
+    const parsed = parseMcpId(args.agent_id, "agent_id");
     if (typeof parsed !== "bigint") return parsed;
     agentId = parsed;
   }
@@ -108,7 +112,7 @@ export async function experimentCreate(
       });
     }
     const created = await createExperiment({
-      tenantId,
+      ctx,
       name: args.name,
       agentId,
       variants: mapVariants(args.variants),
@@ -119,7 +123,7 @@ export async function experimentCreate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.experiment_create",
+      action: "experiment.create",
       target,
       before: null,
       after: truncForAudit({ id: String(created.id), name: args.name }),
@@ -145,8 +149,7 @@ export async function experimentUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
-  const id = parseId(args.experiment_id, "experiment_id");
+  const id = parseMcpId(args.experiment_id, "experiment_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -156,11 +159,20 @@ export async function experimentUpdate(
   } = {};
   if (args.name !== undefined) patch.name = args.name;
   if (args.enabled !== undefined) patch.enabled = args.enabled;
-  if (args.variants !== undefined) patch.variants = mapVariants(args.variants);
+  // Inside a catch boundary, like the create path: `mapVariants` VALIDATES now, so it throws on a
+  // variant the write would refuse — and a tool that throws answers the caller with an exception
+  // instead of the `{ ok: false, error }` every other refusal on this surface produces.
+  if (args.variants !== undefined) {
+    try {
+      patch.variants = mapVariants(args.variants);
+    } catch (e) {
+      return failOf(e);
+    }
+  }
   if (args.agent_id !== undefined) {
     if (args.agent_id === null) patch.agentId = null;
     else {
-      const parsed = parseId(args.agent_id, "agent_id");
+      const parsed = parseMcpId(args.agent_id, "agent_id");
       if (typeof parsed !== "bigint") return parsed;
       patch.agentId = parsed;
     }
@@ -171,7 +183,7 @@ export async function experimentUpdate(
     );
   }
   try {
-    const current = await getExperiment(tenantId, id, base);
+    const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
     const beforeProj = {
       name: current.name,
@@ -188,11 +200,11 @@ export async function experimentUpdate(
         },
       });
     }
-    const updated = await updateExperiment({ tenantId, id, ...patch, base });
+    const updated = await updateExperiment({ ctx, id, ...patch, base });
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.experiment_update",
+      action: "experiment.update",
       target,
       before: truncForAudit(beforeProj),
       after: truncForAudit({
@@ -215,11 +227,10 @@ export async function experimentDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
-  const id = parseId(args.experiment_id, "experiment_id");
+  const id = parseMcpId(args.experiment_id, "experiment_id");
   if (typeof id !== "bigint") return id;
   try {
-    const current = await getExperiment(tenantId, id, base);
+    const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
     const beforeProj = { id: String(current.id), name: current.name };
     if (args.dry_run !== false) {
@@ -230,11 +241,11 @@ export async function experimentDelete(
         current: beforeProj,
       });
     }
-    await deleteExperiment(tenantId, id, base);
+    await deleteExperiment(ctx, id, base);
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.experiment_delete",
+      action: "experiment.delete",
       target,
       before: truncForAudit(beforeProj),
       after: null,
@@ -300,14 +311,6 @@ export async function businessHoursCreate(
       base,
     );
     const target = `business_hours:${created.id}`;
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "mcp.business_hours_create",
-      target,
-      before: null,
-      after: truncForAudit({ id: created.id, name: created.name }),
-    });
     return ok({ dryRun: false, applied: true, target, businessHours: created });
   } catch (e) {
     return failOf(e);
@@ -329,7 +332,7 @@ export async function businessHoursUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.business_hours_id, "business_hours_id");
+  const id = parseMcpId(args.business_hours_id, "business_hours_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -369,19 +372,6 @@ export async function businessHoursUpdate(
       });
     }
     const updated = await updateBusinessHours(ctx, id, patch, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "mcp.business_hours_update",
-      target,
-      before: truncForAudit(beforeProj),
-      after: truncForAudit({
-        name: updated.name,
-        timezone: updated.timezone,
-        windows: updated.windows,
-        exceptions: updated.exceptions,
-      }),
-    });
     return ok({ dryRun: false, applied: true, target, businessHours: updated });
   } catch (e) {
     return failOf(e);
@@ -396,7 +386,7 @@ export async function businessHoursDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.business_hours_id, "business_hours_id");
+  const id = parseMcpId(args.business_hours_id, "business_hours_id");
   if (typeof id !== "bigint") return id;
   try {
     const current = await getBusinessHours(ctx, id, base);
@@ -411,14 +401,6 @@ export async function businessHoursDelete(
       });
     }
     await deleteBusinessHours(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "mcp.business_hours_delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -510,7 +492,6 @@ export async function tenantSettingsUpdate(
         },
       });
     }
-    const before = await getTenantSettings(ctx, base);
     if (args.embedding !== undefined) {
       await updateEmbeddingSettings(ctx, { credentialRef: embeddingRef }, base);
     }
@@ -527,36 +508,8 @@ export async function tenantSettingsUpdate(
       );
     }
     const after = await getTenantSettings(ctx, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "mcp.tenant_settings_update",
-      target,
-      before: truncForAudit({
-        embedding: {
-          credentialRef: before.embedding.credentialRef,
-          model: before.embedding.model,
-        },
-        langfuse: {
-          enabled: before.langfuse.enabled,
-          sendContent: before.langfuse.sendContent,
-          debug: before.langfuse.debug,
-          credentialRef: before.langfuse.credentialRef,
-        },
-      }),
-      after: truncForAudit({
-        embedding: {
-          credentialRef: after.embedding.credentialRef,
-          model: after.embedding.model,
-        },
-        langfuse: {
-          enabled: after.langfuse.enabled,
-          sendContent: after.langfuse.sendContent,
-          debug: after.langfuse.debug,
-          credentialRef: after.langfuse.credentialRef,
-        },
-      }),
-    });
+    // NOTE: each block writer above records its own row, so a call touching both leaves TWO where
+    // this tool used to leave one summarizing both. Same shape the console has always produced.
     // Project stored vault:<id> refs back to NAMES for the response (never a secret value).
     const embName = after.embedding.credentialRef
       ? await vaultNameByRef(ctx, after.embedding.credentialRef, base)
@@ -658,16 +611,17 @@ export async function langfuseConnect(
       { enabled, credentialRef: ref, sendContent: args.send_content },
       base,
     );
+    // NOTE: narrowed to the VAULT write, which is the half `updateLangfuse` cannot record. Two
+    // writes, two rows, not one write recorded twice; this one goes when the vault family moves (#399).
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.langfuse_connect",
-      target: "tenant_settings:langfuse",
+      action: "langfuse.connect",
+      target: `vault:${name}`,
       before: null,
       after: truncForAudit({
         credentialName: name,
         baseUrl: args.base_url,
-        enabled: settings.enabled,
       }),
     });
     const lfName = settings.credentialRef
@@ -694,7 +648,7 @@ export async function apiKeyRevoke(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.api_key_id, "api_key_id");
+  const id = parseMcpId(args.api_key_id, "api_key_id");
   if (typeof id !== "bigint") return id;
   const target = `api_key:${id}`;
   try {
@@ -707,14 +661,6 @@ export async function apiKeyRevoke(
       });
     }
     await revokeApiKey(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "mcp.api_key_revoke",
-      target,
-      before: null,
-      after: truncForAudit({ revoked: true }),
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);

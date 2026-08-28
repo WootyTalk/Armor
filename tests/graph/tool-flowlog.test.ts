@@ -16,6 +16,7 @@ import { failableTool, toolFailure } from "@/graph/tools/failure";
 import type { TenantContext } from "@/lib/tenancy";
 import { createAlertChannel } from "@/modules/flowlog/channels";
 import type { FlowContext } from "@/modules/flowlog/service";
+import { flowLogRows } from "../utils/flowlog";
 import { outboundUrl } from "../utils/outbound";
 
 // NOTE: The tool line of the execution-flow log must distinguish integration failures from successes:
@@ -66,7 +67,7 @@ type LogRow = {
 // NOTE: emitFlowEvent is fire-and-forget; poll until the expected row count lands.
 async function pollToolRows(turnId: string, count: number): Promise<LogRow[]> {
   for (let i = 0; i < 50; i++) {
-    const rows = await suDb.executionLog.findMany({
+    const rows = await flowLogRows(suDb, {
       where: { tenantId, turnId, stage: "tool" },
       select: {
         level: true,
@@ -158,6 +159,41 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     expect(rows[0]?.level).toBe("info");
     expect(rows[0]?.status).toBe("ok");
     expect(rows[0]?.errorMessage).toBeNull();
+  });
+
+  // Issue #243, and the concrete way a third party's characters reach `execution_logs.error_message`.
+  // An HTTP tool passes the remote's response body through verbatim so the model can read it, and
+  // `toolFailure` makes that body the failure's cause. With `logToolValues` on, the operator asked to
+  // SEE that body, so `failureCause` hands the whole thing here instead of the first line.
+  //
+  // `error_message` is a `text` column and Postgres refuses a NUL in one (22021), while emitFlowEvent
+  // is fire-and-forget with a catch: the refusal never reaches the turn and the line is simply not
+  // there. Turning detailed logging ON is what used to make the log line disappear.
+  test("a response body carrying a NUL still lands the tool line", async () => {
+    const flow = flowCtx();
+    const logger = new ToolFlowLogger(flow, { logValues: true });
+    logger.handleToolStart(
+      {} as never,
+      "{}",
+      "run-nul",
+      undefined,
+      undefined,
+      undefined,
+      "probe",
+    );
+    logger.handleToolEnd(
+      new ToolMessage({
+        status: "error",
+        content: `HTTP 400\n{"detail":"bad${String.fromCharCode(0)}request"}`,
+        tool_call_id: "c1",
+        name: "probe",
+      }),
+      "run-nul",
+    );
+    const rows = await pollToolRows(flow.turnId, 1);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("error");
+    expect(rows[0]?.errorMessage).toContain("HTTP 400");
   });
 
   test("a ToolMessage with status error logs ONE warn/error line carrying the message", async () => {
@@ -298,6 +334,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     });
     const model = new ToolCallThenReplyModel("probe_fail", "entendi");
     const graph = buildAgentGraph({
+      primary: { provider: "openai", model: "test-model" },
       model: model as unknown as BaseChatModel,
       systemPrompt: "Você é prestativa.",
       checkpointer: new MemorySaver(),
@@ -349,6 +386,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     });
     const model = new ToolCallThenReplyModel("probe_alert", "ok");
     const graph = buildAgentGraph({
+      primary: { provider: "openai", model: "test-model" },
       model: model as unknown as BaseChatModel,
       systemPrompt: "Você é prestativa.",
       checkpointer: new MemorySaver(),
@@ -395,6 +433,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       });
       const model = new ToolCallThenReplyModel("probe_image", "pronto", args);
       const graph = buildAgentGraph({
+        primary: { provider: "openai", model: "test-model" },
         model: model as unknown as BaseChatModel,
         systemPrompt: "Você é prestativa.",
         checkpointer: new MemorySaver(),

@@ -1,7 +1,11 @@
 import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
-import { TenantTargetRequiredError } from "@/lib/errors";
+import {
+  ActiveTenantNotFoundError,
+  TenantTargetRequiredError,
+} from "@/lib/errors";
 import type { ScopedDb, TenantContext } from "./context";
+import { FLEET_ROLE_FN } from "./fleet-role";
 
 // NOTE: the closure-extended `$extends` client is not the bare PrismaClient type, but it
 // still exposes `$transaction`. Accept anything transaction-capable for the *On helpers so
@@ -13,10 +17,12 @@ type TransactionCapable = Pick<PrismaClient, "$extends" | "$transaction">;
 // boundary; this extension only supplies tenant_id on insert (so WITH CHECK passes and
 // callers need not pass it) and overrides any caller-supplied tenant_id (anti-spoof).
 const TENANT_SCOPED_MODELS = new Set<string>([
+  "Appointment",
   "ChatwootInstance",
   "ChatwootWebhookDelivery",
   "Inbox",
   "Contact",
+  "ContactAuthGrant",
   "Conversation",
   "Agent",
   "BusinessHours",
@@ -34,7 +40,8 @@ const TENANT_SCOPED_MODELS = new Set<string>([
   "WebhookSubscription",
   "OutboundWebhookDelivery",
   "SchedulerJob",
-  "Quote",
+  "DocumentTemplate",
+  "IssuedDocument",
   "Experiment",
   "PromptVariantAssignment",
   "LlmUsage",
@@ -43,6 +50,7 @@ const TENANT_SCOPED_MODELS = new Set<string>([
   "AlertDelivery",
   "ApiKey",
   "AttendanceSummary",
+  "PlaygroundTurnNote",
 ]);
 
 function withTenant<T>(data: T, tenantId: bigint): T {
@@ -79,11 +87,74 @@ function makeScopedExtension(tenantId: bigint) {
   });
 }
 
+// A SUPER_ADMIN's target tenant is the only tenant id that reaches this boundary from OUTSIDE the
+// process: it comes from a per-request selector (the `X-Tenant-Id` header, which the console persists
+// in the browser, or an MCP call's `tenant` argument), so it can name a tenant that no longer exists.
+// Every context this process builds for itself carries an id it just read from a row, and carries
+// TENANT_ADMIN, which is what makes the role the whole predicate.
+//
+// Unverified, that id is not an error anywhere, which is the problem. RLS scopes the transaction to a
+// tenant with no rows, so a READ answers with defaults (a settings screen loads empty, looking
+// healthy) and a WRITE fails inside Prisma (measured: P2025 on an update, P2003 on an insert).
+// Neither of those is an AppError, so `onError` falls through to its generic branch and the operator
+// is told "something went wrong", with no reason, on a screen whose data was never real. Issue #223.
+//
+// The MCP transport already asks this question, per call, before it builds the principal
+// (`resolveTenantSelector`, answering "Tenant not found"). Same question, same answer, so the two
+// transports cannot diverge.
+//
+// They diverged anyway, twice, and both times the same way: a REST controller unwrapped the request
+// context down to `ctx.tenantId` and handed the bare id to a module that rebuilt a TENANT_ADMIN
+// context around it, so this check saw an internal id and skipped. #268 was the playground; #280 was
+// knowledge/RAG, experiments, integrations, documents and the n8n export. Nothing here can catch
+// that — the lie is well-formed by the time it arrives — so the fence is on the transport, where the
+// provenance is still known: `tests/modules/tenant-selector-entry-points.test.ts`.
+//
+// One statement, in a transaction that is already open, and only where the id is unverified. Asking
+// at the request boundary instead would cost a transaction of its own on every request the fleet
+// operator makes, and the first-run operator of EVERY installation is a SUPER_ADMIN.
+async function requireTenantExists(
+  db: ScopedDb,
+  tenantId: bigint,
+): Promise<void> {
+  // Visible under the GUC set above iff it exists: the tenants policy is `id = app.tenant_id`.
+  const row = await db.tenant.findUnique({
+    where: { id: tenantId },
+    select: { id: true },
+  });
+  if (!row) {
+    // The same status and key the MCP selector and `getTenant` already answer with, in a class of
+    // its own: this is the only one of the seven that refuses the selector the CALLER WAS CARRYING
+    // rather than a tenant its request named, and the console has to tell them apart to know whether
+    // to drop what it has stored (src/lib/console-params.ts).
+    throw new ActiveTenantNotFoundError(tenantId);
+  }
+}
+
 // NOTE: no network/LLM await inside `fn` — the transaction pins a pooled connection and
 // long I/O would exhaust the pool. Keep fn to DB work; do network I/O outside.
 //
+// "Network" includes A SECOND POSTGRES. The `ingest:<threadId>` sections used to await the LangGraph
+// checkpointer, which has its own pool and its own connections, from in here, and the rule read as satisfied
+// because nothing was calling an HTTP API. It cost the same: a connection held idle-in-transaction
+// across another pool's round-trips, this pool drained, and every unrelated query failing on
+// `maxWait` (issue #225). If `fn` awaits anything that is not this transaction, it does not belong.
+//
 // `...On` variants take the base client explicitly so integration tests can pass their own
 // (real) client instead of the singleton, which unit tests mock globally.
+// Stated rather than inherited. These ARE the Prisma defaults, and that is the problem: the two
+// failures a drained pool produces name these exact numbers ("Unable to start a transaction in the
+// given time" is `maxWait`; "a query cannot be executed on an expired transaction" is `timeout`),
+// and neither number appeared anywhere in this repository. Naming them here is what makes the
+// budget greppable from the error, and tunable in one place if it ever has to move.
+export const SCOPED_TX_OPTIONS = {
+  // Time to WAIT for a free connection before giving up.
+  maxWait: 2_000,
+  // Time the transaction may stay open once it has one. Every section in here is DB-only work by the
+  // rule above, so this is a ceiling on a pathology, not a budget anything should approach.
+  timeout: 5_000,
+} as const;
+
 export async function runScopedOn<T>(
   base: TransactionCapable,
   ctx: TenantContext,
@@ -98,8 +169,10 @@ export async function runScopedOn<T>(
     // transaction-local GUC: RLS policies scope every statement to this tenant; resets
     // on commit/rollback so it cannot leak to the next request on a pooled connection.
     await tx.$executeRaw`SELECT set_config('app.tenant_id', ${String(tenantId)}, true)`;
-    return fn(tx as unknown as ScopedDb);
-  });
+    const db = tx as unknown as ScopedDb;
+    if (ctx.role === "SUPER_ADMIN") await requireTenantExists(db, tenantId);
+    return fn(db);
+  }, SCOPED_TX_OPTIONS);
 }
 
 export async function runScoped<T>(
@@ -109,17 +182,38 @@ export async function runScoped<T>(
   return runScopedOn(basePrisma, ctx, fn);
 }
 
-// NOTE: audited cross-tenant / fleet path. Sets app.is_super_admin so RLS allows all
-// rows (incl. tenant_id NULL audit rows and creating new tenants where WITH CHECK could
+// NOTE: audited cross-tenant / fleet path. Becomes the fleet role for the length of this transaction,
+// which is what the `fleet_super_admin` policy on every table under RLS is written `TO` — so RLS
+// allows all rows (incl. tenant_id NULL audit rows and creating new tenants where WITH CHECK could
 // not otherwise pass). Caller must have role SUPER_ADMIN; enforce at the call site.
+//
+// This used to be `set_config('app.is_super_admin', 'on', true)`, read by an OR inside the same
+// policy that carries the tenant predicate. That OR is what made every tenant index unreachable
+// (issue #382, and the numbers are in the migration that split it) — a policy branch naming no
+// column cannot become an index condition, and neither can the branch beside it.
+//
+// `set_config('role', ...)` rather than `SET LOCAL ROLE`: it is the same transaction-local
+// mechanism (measured: `current_user` is back to the session user after both commit and rollback)
+// and, unlike `SET ROLE`, it takes the role as an EXPRESSION — which is what lets the name be
+// resolved by the database rather than assembled here.
+//
+// `Prisma.raw` rather than `$executeRawUnsafe`: the function CALL has to reach Postgres as SQL and
+// not as a bind parameter, and this is the spelling that keeps the tagged template. It carries no
+// caller input — `FLEET_ROLE_FN` is a constant of this repository — and the name it resolves to
+// never leaves the server.
+//
+// It is not a privilege escalation the old GUC did not already allow: reaching this needs a
+// statement on the runtime connection, which is what setting the GUC needed too. What DID change is
+// that the GUC now grants nothing at all, so the old spelling fails closed rather than silently
+// still working — `tests/lib/rls-policy-shape.test.ts` asserts that.
 export async function asSuperAdminOn<T>(
   base: TransactionCapable,
   fn: (db: ScopedDb) => Promise<T>,
 ): Promise<T> {
   return base.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT set_config('app.is_super_admin', 'on', true)`;
+    await tx.$executeRaw`SELECT set_config('role', ${Prisma.raw(FLEET_ROLE_FN)}, true)`;
     return fn(tx as unknown as ScopedDb);
-  });
+  }, SCOPED_TX_OPTIONS);
 }
 
 export async function asSuperAdmin<T>(

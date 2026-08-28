@@ -3,6 +3,7 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { clipText } from "@/lib/text";
 import { stashMediaAnnotation } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
@@ -218,7 +219,11 @@ export async function transcribeInboundAudio(
 }
 
 export interface PlaygroundTranscribeParams {
-  tenantId: bigint;
+  // The REQUEST's context, unlike the inbound path above, whose tenant id this process read from a
+  // row. Rebuilding one here would tell the unknown-tenant check at `runScopedOn` that a caller's
+  // stale selector was internal, and the operator would get "agent not found" for a tenant that is
+  // gone rather than a refusal naming the selection they are carrying (issue #268).
+  ctx: TenantContext;
   agentId: bigint;
   audio: ArrayBuffer;
   mimeType: string | null;
@@ -243,7 +248,7 @@ export async function transcribePlaygroundAudio(
   const cfg =
     params.settings !== undefined
       ? readSttConfig(params.settings)
-      : await runScopedOn(base, sysCtx(params.tenantId), async (db) => {
+      : await runScopedOn(base, params.ctx, async (db) => {
           const agent = await db.agent.findUnique({
             where: { id: params.agentId },
             select: { settings: true },
@@ -260,7 +265,7 @@ export async function transcribePlaygroundAudio(
       "errors.sttNotConfigured",
     );
   }
-  const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+  const entry = await runScopedOn(base, params.ctx, (db) =>
     tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
   );
   if (!entry) {
@@ -273,7 +278,7 @@ export async function transcribePlaygroundAudio(
   const effectiveBaseURL = entry.baseUrl ?? cfg.baseURL;
   if (provider.requiresBaseURL && !effectiveBaseURL) {
     throw new AppError(
-      "provider requires a base URL",
+      "A base URL is required for this provider.",
       400,
       "errors.baseUrlRequired",
     );
@@ -291,11 +296,12 @@ export async function transcribePlaygroundAudio(
       fetchImpl: params.deps?.fetchImpl ?? fetch,
     });
   } catch (e) {
-    const detail = (e instanceof Error ? e.message : String(e)).slice(0, 300);
+    const detail = clipText(e instanceof Error ? e.message : String(e), 300);
     throw new AppError(
       `transcription failed: ${detail}`,
       502,
       "errors.sttFailed",
+      { detail },
     );
   }
   return cleanTranscription(raw);

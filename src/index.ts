@@ -5,10 +5,15 @@ import app from "@/app";
 import config from "@/config";
 import {
   assertRuntimeRoleIsNotSuperuser,
-  SuperuserRuntimeError,
+  RuntimeIsolationError,
 } from "@/lib/db-guard";
 import { registerAppointmentReminderHandler } from "@/modules/appointments/reminders";
 import { registerRedirectFollowUpHandlers } from "@/modules/channel-redirect/followup";
+import {
+  ensureAllDeliverySweeps,
+  registerDeliverySweepHandler,
+} from "@/modules/chatwoot/delivery-sweep";
+import { registerDeliveryRecoveryHandler } from "@/modules/chatwoot/recover-delivery";
 import { registerDebounceHandler } from "@/modules/debounce/handler";
 import {
   startDebounceWorker,
@@ -87,13 +92,18 @@ for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
   }
 }
 
-// NOTE: Fail fast if the runtime DB role can bypass RLS — isolation rests on it. A privileged
-// role hard-crashes the process (correct: crash-loop until the URL is fixed); a DB-unavailable
-// error only warns, since initSetupState below already tolerates a boot-time outage.
+// NOTE: Fail fast if the runtime DB connection cannot uphold isolation. Any refusal the guard makes
+// hard-crashes the process (correct: crash-loop until it is fixed); a DB-unavailable error only
+// warns, since initSetupState below already tolerates a boot-time outage.
+//
+// Caught on the BASE class, never on one refusal by name: the guard grew a second one
+// (`FleetPolicyMismatchError`, for a database restored under another name) and a `instanceof
+// SuperuserRuntimeError` here swallowed it as an outage, leaving the process serving with every
+// cross-tenant read answering zero rows.
 try {
   await assertRuntimeRoleIsNotSuperuser();
 } catch (error) {
-  if (error instanceof SuperuserRuntimeError) throw error;
+  if (error instanceof RuntimeIsolationError) throw error;
   logger.warn(
     { error },
     "Could not verify the runtime DB role (DB unavailable?); continuing",
@@ -165,6 +175,8 @@ if (config.schedulerWorker.enabled) {
   registerAppointmentReminderHandler();
   registerRedirectFollowUpHandlers();
   registerMemoryHandlers();
+  registerDeliverySweepHandler();
+  registerDeliveryRecoveryHandler();
   startScheduler();
   // Arm the per-tenant execution-log retention sweep for every existing tenant (best-effort: a
   // boot-time DB outage just means the sweep arms on the next restart).
@@ -175,6 +187,12 @@ if (config.schedulerWorker.enabled) {
   // sweep's row is lost (DB reset, external truncate). Same best-effort discipline as above.
   void ensureAllTenantSweeps().catch((error) =>
     logger.warn({ error }, "Failed to arm follow-up sweeps"),
+  );
+  // Arm the per-tenant recovery sweep for Chatwoot deliveries stranded on PROCESSING (issue #228).
+  // A deploy is both the thing that strands them and the thing that runs this, so the boot arm is
+  // what makes the recovery reach the rows the restart itself created.
+  void ensureAllDeliverySweeps().catch((error) =>
+    logger.warn({ error }, "Failed to arm Chatwoot delivery sweeps"),
   );
 }
 
@@ -203,8 +221,17 @@ if (config.compactionWorker.enabled) {
   startCompactionWorker();
 }
 
+// NOTE: reached through the EventEmitter surface because `process.on("SIGTERM", …)` no longer
+// type-checks. @types/node 25 declares `Process extends InternalEventEmitter<ProcessEventMap>`, so
+// the signal handlers are INHERITED from an event map rather than declared as overloads, and
+// bun-types 1.4.0 augments `NodeJS.Process` with an explicit `on(event: "memoryPressure", …)`. A
+// member declared on the interface shadows the inherited one, so `on` narrows to "memoryPressure"
+// alone. Measured against this tsconfig: the literal call, `node:process`, a `NodeJS.Signals` cast,
+// `addListener` and `once` all fail; only the EventEmitter surface compiles. Upstream bug in
+// bun-types, not in this code — drop the cast once it declares these as overloads.
+const processEvents = process as NodeJS.EventEmitter;
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.on(signal, () => {
+  processEvents.on(signal, () => {
     stopOutboundWorker();
     stopScheduler();
     stopDebounceWorker();

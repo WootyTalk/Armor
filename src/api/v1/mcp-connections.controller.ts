@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -15,6 +16,18 @@ import {
   mcpReferences,
   updateMcpConnection,
 } from "@/modules/mcp-connections/service";
+
+// The error catalog this controller's routes answer with. `bun i18n:extract` materialises
+// src/api/locales/*.json from these lines and prunes anything nothing references, and
+// `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
+// throw site rather than an English sentence on a pt-BR caller's screen.
+// translate('errors.mcpCommandInvalid', 'The stdio command contains unsupported characters.')
+// translate('errors.mcpCommandRequired', 'The stdio transport requires a command.')
+// translate('errors.mcpConnectionNotFound', 'MCP connection not found.')
+// translate('errors.mcpLauncherInvalid', 'The stdio command must start with a supported launcher ({{launchers}}).')
+// translate('errors.mcpNameTaken', 'That MCP connection name is already in use.')
+// translate('errors.mcpStdioDisabled', 'The stdio transport is disabled on this server.')
+// translate('errors.mcpUrlRequired', 'The http/sse transport requires a URL.')
 
 // Consumed MCP server connections (per-tenant). TENANT_ADMIN. Mounted at /v1/mcp-connections, NOT
 // /v1/mcp (that prefix is the MCP transport this app EXPOSES). `discover` connects to the server to
@@ -67,6 +80,22 @@ const writeBody = t.Object({
   ),
 });
 
+// The CREATE route's own body. `writeBody` above describes what a PATCH accepts, where every field
+// being optional is correct, and a POST that borrows it lets a request missing a required field
+// through the transport: the refusal then comes from the service's zod schema, whose `ZodError`
+// src/app.ts has no branch for, so the caller is told the server broke about a field they own
+// (issue #301, measured: `POST` with `{}` answered 500 `Something went wrong`).
+//
+// Composed rather than written out, so the descriptions and the field list stay in one place and a
+// field added to `writeBody` cannot be missing here. WHICH fields are required is not written twice
+// either: tests/api/v1/write-body-required.test.ts derives that set from the service's create schema
+// and fails if the two drift.
+const CREATE_REQUIRED = ["name", "transport"] as const;
+const createBody = t.Composite([
+  t.Omit(writeBody, CREATE_REQUIRED),
+  t.Required(t.Pick(writeBody, CREATE_REQUIRED)),
+]);
+
 export const mcpConnectionsController = new Elysia({
   prefix: "/v1/mcp-connections",
   tags: ["MCP"],
@@ -84,7 +113,7 @@ export const mcpConnectionsController = new Elysia({
         "List MCP connections",
         "Returns the tenant's consumed MCP server connections.",
       ),
-      response: errors(401, 403),
+      response: errors(401, 403, 404),
     },
   )
   .get(
@@ -93,7 +122,7 @@ export const mcpConnectionsController = new Elysia({
       instance: instanceIdentity,
       connection: await getMcpConnection(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -103,7 +132,7 @@ export const mcpConnectionsController = new Elysia({
         "Returns a single consumed MCP server connection by id.",
       ),
       params: idParams,
-      response: errors(401, 403, 404),
+      response: errors(400, 401, 403, 404),
     },
   )
   .get(
@@ -112,7 +141,7 @@ export const mcpConnectionsController = new Elysia({
       instance: instanceIdentity,
       references: await mcpReferences(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -140,8 +169,8 @@ export const mcpConnectionsController = new Elysia({
         "Create MCP connection",
         "Registers a new consumed MCP server connection for the tenant.",
       ),
-      body: writeBody,
-      response: errors(400, 401, 403),
+      body: createBody,
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .patch(
@@ -150,7 +179,7 @@ export const mcpConnectionsController = new Elysia({
       instance: instanceIdentity,
       connection: await updateMcpConnection(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body as McpConnectionUpdate,
       ),
     }),
@@ -162,13 +191,16 @@ export const mcpConnectionsController = new Elysia({
       ),
       params: idParams,
       body: writeBody,
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .delete(
     "/:id",
     async ({ tenantContext, params }) => {
-      await deleteMcpConnection(ctxOrThrow(tenantContext), BigInt(params.id));
+      await deleteMcpConnection(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      );
       return { instance: instanceIdentity, success: true };
     },
     {
@@ -186,7 +218,7 @@ export const mcpConnectionsController = new Elysia({
     async ({ tenantContext, params }) => {
       const discovered = await discoverMcpTools(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       return {
         instance: instanceIdentity,

@@ -28,6 +28,8 @@ function conversationEvent(over: Partial<StatePayload> = {}): StatePayload {
     status: "resolved",
     assigneeStated: true,
     assigneeType: "User",
+    redirectOriginCleared: false,
+    redirectOriginStated: false,
     ...over,
   };
 }
@@ -46,6 +48,8 @@ function storedRow(over: Partial<StateRow> = {}): StateRow {
     statusAt: V_NOW,
     assigneeAt: V_NOW,
     assigneeType: "AgentBot",
+    redirectOriginAt: null,
+    redirectOriginKnown: false,
     ...over,
   };
 }
@@ -92,6 +96,43 @@ const CASES: Case[] = [
     }),
     row: storedRow({ assigneeType: "User" }),
     want: { status: "open", assignee: false },
+  },
+  // A reopen is faithful AT ITS OWN INSTANT, and every payload here is a snapshot of an earlier one:
+  // Chatwoot freezes its own at enqueue, and a delivery recovery rebuilds one from reads made a
+  // moment before (#295). Unordered, the exception says a message may reopen whenever it arrives,
+  // and a message serialized before an operator's resolve walks the status back to `open` after it.
+  {
+    // The row is built so the ONLY thing that can refuse this is the new rule: the payload is ahead
+    // of the row's activity, so it is not stale, and its status mark sits a whole hour later —
+    // which is what a resolve does, since a resolve moves `updated_at` and never `last_activity_at`.
+    name: "a reopen from a second BEHIND the status mark does not walk it back",
+    payload: messageEvent({
+      reopensConversation: true,
+      activityAt: NOW,
+      status: "open",
+    }),
+    row: storedRow({
+      activityAt: LATER,
+      statusAt: NOW.getTime() / 1000 + 3600,
+    }),
+    want: { status: null },
+  },
+  {
+    // The other side, and the one that keeps issue #61's burst working: the mark carries a fraction
+    // (`updated_at`) and the message carries whole seconds (`last_activity_at`), so within one burst
+    // the mark is always a little ahead of the message it accompanies. Compared raw, every
+    // same-second reopen would lose to its own companion.
+    name: "a reopen in the SAME second as the status mark still wins",
+    payload: messageEvent({
+      reopensConversation: true,
+      activityAt: NOW,
+      status: "open",
+    }),
+    row: storedRow({
+      activityAt: LATER,
+      statusAt: NOW.getTime() / 1000 + 0.202,
+    }),
+    want: { status: "open" },
   },
   {
     name: "the reopen claims the status mark and leaves the assignee mark behind",
@@ -241,6 +282,95 @@ const CASES: Case[] = [
     payload: conversationEvent({ status: null }),
     row: null,
     want: { status: null, statusAt: null, assigneeAt: V_NEW },
+  },
+
+  // The redirect pairing (#222), on its own mark. The consumer of this field messages AND resolves
+  // the conversation it names, so a value that regresses to a previous episode's origin acts
+  // destructively on the wrong WhatsApp thread.
+  {
+    name: "a payload that names no origin writes none and stamps nothing",
+    payload: messageEvent({ activityAt: NOW }),
+    row: storedRow({ redirectOriginAt: V_NOW }),
+    want: { redirectOrigin: false, redirectOriginAt: null },
+  },
+  {
+    name: "a message snapshot DOES carry the pairing, unlike status and assignee",
+    payload: messageEvent({ activityAt: NOW, redirectOriginStated: true }),
+    row: storedRow(),
+    want: { redirectOrigin: true, redirectOriginAt: V_NEW },
+  },
+  {
+    name: "a retried snapshot behind the mark cannot regress the pairing",
+    payload: messageEvent({
+      version: V_OLD,
+      activityAt: LATER,
+      redirectOriginStated: true,
+    }),
+    row: storedRow({ redirectOriginAt: V_NOW }),
+    want: { stale: false, redirectOrigin: false, redirectOriginAt: null },
+  },
+  {
+    name: "an equal version writes the same reading rather than letting delivery order decide",
+    payload: messageEvent({ version: V_NOW, redirectOriginStated: true }),
+    row: storedRow({ redirectOriginAt: V_NOW }),
+    want: { redirectOrigin: true, redirectOriginAt: null },
+  },
+  // The event the fork emits when the pairing changes on an existing conversation: a fresh version
+  // and a last_activity_at that a column write never moved. Recency would discard it; version does not.
+  {
+    name: "the pairing's own event applies on version, with a frozen last_activity_at",
+    payload: conversationEvent({
+      version: V_NEW,
+      activityAt: EARLIER,
+      redirectOriginStated: true,
+    }),
+    row: storedRow({ activityAt: LATER, redirectOriginAt: V_OLD }),
+    want: { redirectOrigin: true, redirectOriginAt: V_NEW, unversioned: false },
+  },
+  // The stale branch's one exception: `stale` means "behind on every axis this payload OFFERS", and
+  // the pairing is an axis of its own. The first payload to carry one is routinely behind on the
+  // others — a retry, or any event on a conversation the mirror followed since before the fork had
+  // the field, where the other two marks are set and this one is null.
+  {
+    name: "a stale event still delivers a pairing its own mark does not refuse",
+    payload: conversationEvent({ version: V_OLD, redirectOriginStated: true }),
+    row: storedRow({ redirectOriginAt: null }),
+    want: { stale: true, redirectOrigin: true, redirectOriginAt: V_OLD },
+  },
+  {
+    name: "...and nothing else leaks through with it",
+    payload: conversationEvent({
+      version: V_OLD,
+      reopensConversation: true,
+      redirectOriginStated: true,
+    }),
+    row: storedRow({ redirectOriginAt: null }),
+    want: { status: null, assignee: false, unversioned: false },
+  },
+  {
+    name: "a stale event behind the redirect mark too writes no pairing",
+    payload: conversationEvent({ version: V_OLD, redirectOriginStated: true }),
+    row: storedRow({ redirectOriginAt: V_NOW }),
+    want: { stale: true, redirectOrigin: false, redirectOriginAt: null },
+  },
+  {
+    name: "a stale event that names no pairing writes none",
+    payload: conversationEvent({ version: V_OLD }),
+    row: storedRow({ redirectOriginAt: null }),
+    want: { stale: true, redirectOrigin: false, redirectOriginAt: null },
+  },
+  // No version to order by (Chatwoot < 4.0.2): the pre-fence behaviour, stated rather than implied.
+  {
+    name: "a versionless payload writes the pairing and stamps no mark",
+    payload: messageEvent({ version: null, redirectOriginStated: true }),
+    row: storedRow({ redirectOriginAt: null }),
+    want: { redirectOrigin: true, redirectOriginAt: null },
+  },
+  {
+    name: "the first pairing seen on a conversation with no row claims the mark",
+    payload: messageEvent({ redirectOriginStated: true }),
+    row: null,
+    want: { redirectOrigin: true, redirectOriginAt: V_NEW },
   },
 ];
 

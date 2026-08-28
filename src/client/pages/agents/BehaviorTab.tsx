@@ -7,16 +7,18 @@ import {
   Image,
   ImagePlus,
   Layers,
+  LifeBuoy,
   ListChecks,
   Megaphone,
   Mic,
   Plus,
   Scissors,
   ScrollText,
+  ShieldCheck,
   Trash2,
   Volume2,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
@@ -42,6 +44,7 @@ import {
   VISION_DEFAULT_MODEL,
 } from "@/client/lib/providerDefaults";
 import { providerLabel } from "@/client/lib/providerLabels";
+import { serverNow, serverNowDate } from "@/client/lib/serverClock";
 import { isValidHttpUrl } from "@/client/lib/validation";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
@@ -52,8 +55,27 @@ import {
 } from "@/modules/agents/text-caps";
 import { formatWindowsSummary } from "@/modules/business-hours/announce";
 import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
+import { debugModesFrom } from "@/modules/flowlog/debug-mode";
+import {
+  FULL_DETAIL_ARM_HOURS,
+  isFullDetailWindowOpen,
+  type ObservabilityConfig,
+} from "@/modules/flowlog/settings";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
+import { visionAcceptsDocuments } from "@/modules/vision/document-support";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
+import {
+  fallbackIsConfigured,
+  fallbackModelIsMissing,
+} from "./modelFallbackFormState";
+import {
+  overrideBaseUrlInvalid,
+  overrideBaseUrlUnsupported,
+  overrideNeedsOwnCredential,
+  overridePicked,
+  overridePickerSource,
+  overrideProviderChanged,
+} from "./modelOverrideForm";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
 import {
@@ -65,7 +87,7 @@ import {
   ttsNormalizerPickerSource,
   ttsNormalizerProviderChanged,
 } from "./ttsFormState";
-import type { Hours } from "./types";
+import type { BehaviorRefusals, Hours } from "./types";
 
 // Transcription providers (mirror src/modules/stt/providers.ts).
 const STT_PROVIDERS = [
@@ -122,6 +144,27 @@ interface SttState {
   baseURL: string;
 }
 
+// NOTE: The contact authorization gate (agent.settings.contactAuth). Numbers stay text so a
+// half-typed value survives editing; the runtime reader clamps on read and the save normalizes.
+export interface ContactAuthState {
+  enabled: boolean;
+  url: string;
+  credentialRef: string;
+  timeoutMs: string;
+  noticeCooldownSeconds: string;
+  includeMessageText: boolean;
+  denyMessage: string;
+  // "perMessage" | "once" — kept as a plain string like every other select in this file; the
+  // runtime reader is what decides, and it treats anything but "once" as the default.
+  mode: string;
+  grantTtlSeconds: string;
+  handoffEnabled: boolean;
+  handoffTeamId: string;
+  // The ChatwootInstance the team above was picked from, recorded with it: a team id belongs to one
+  // account, and the runtime only assigns it in that one.
+  handoffTeamInstanceId: string;
+}
+
 interface SplitState {
   enabled: boolean;
   maxChars: string;
@@ -148,6 +191,26 @@ interface LimitsState {
 // NOTE: The allowed-host list is edited as raw textarea text (one per line) and only turns into an
 // array on save — the runtime reader normalizes and drops what does not resolve to a hostname, so
 // the operator's half-typed line survives editing instead of vanishing under them.
+// The summarizer's block. The four model fields are an OVERRIDE of the agent's model: all blank is
+// "run on the agent's model", which is what every agent that never touched this means.
+export interface MemoryState {
+  compactionEnabled: boolean;
+  provider: string;
+  model: string;
+  credentialRef: string;
+  baseURL: string;
+}
+
+// The second provider behind the agent's own. No `enabled` flag of its own, deliberately: a
+// fallback exists exactly when a provider AND a model are named, so the switch would be a third way
+// to say the same thing and a way for the two to disagree.
+export interface ModelFallbackState {
+  provider: string;
+  model: string;
+  credentialRef: string;
+  baseURL: string;
+}
+
 export interface SendImageState {
   allowedHosts: string;
 }
@@ -169,15 +232,16 @@ interface ServiceWindowState {
   templateContent: string;
 }
 
-interface FollowUpStepState {
+export interface FollowUpStepState {
   delayValue: string;
   delayUnit: string;
   instructions: string;
   assignLabels: string[]; // labels added to the conversation when this step fires
   resolve: boolean; // honored only on the last step
+  ignoreAppointmentPause: boolean; // fire this step even while an appointment stands
 }
 
-interface FollowUpState {
+export interface FollowUpState {
   enabled: boolean;
   steps: FollowUpStepState[];
   pauseWhileAppointment: boolean;
@@ -185,6 +249,9 @@ interface FollowUpState {
 
 interface BehaviorTabProps {
   agentId: string;
+  // The refused input this tab draws, if the standing refusal is about one of them. Read in
+  // AgentEditorPage and passed as answers -- see the note on the type.
+  refusals: BehaviorRefusals;
   hours: Hours[];
   businessHoursId: string;
   setBusinessHoursId: (v: string) => void;
@@ -199,6 +266,8 @@ interface BehaviorTabProps {
   stt: SttState;
   setStt: React.Dispatch<React.SetStateAction<SttState>>;
   sttCredBaseUrl: string | null;
+  contactAuth: ContactAuthState;
+  setContactAuth: React.Dispatch<React.SetStateAction<ContactAuthState>>;
   tts: TtsFormState;
   setTts: React.Dispatch<React.SetStateAction<TtsFormState>>;
   // The agent's own model, to render the speech rewrite's inherited default honestly (blank there
@@ -215,14 +284,27 @@ interface BehaviorTabProps {
   setVision: React.Dispatch<React.SetStateAction<VisionState>>;
   visionCredBaseUrl: string | null;
   limits: LimitsState;
-  memory: { compactionEnabled: boolean };
-  setMemory: React.Dispatch<
-    React.SetStateAction<{ compactionEnabled: boolean }>
-  >;
-  observability: { logToolValues: boolean };
-  setObservability: React.Dispatch<
-    React.SetStateAction<{ logToolValues: boolean }>
-  >;
+  memory: MemoryState;
+  setMemory: React.Dispatch<React.SetStateAction<MemoryState>>;
+  modelFallback: ModelFallbackState;
+  setModelFallback: React.Dispatch<React.SetStateAction<ModelFallbackState>>;
+  modelFallbackCredBaseUrl: string | null;
+  // The base URL stored on the summarizer's OWN credential, when it has one. Outranks the typed
+  // field, exactly as it does for the speech rewrite.
+  memoryCredBaseUrl: string | null;
+  observability: ObservabilityConfig;
+  setObservability: React.Dispatch<React.SetStateAction<ObservabilityConfig>>;
+  // What the SERVER is recording right now, which is not what the switches say once one is touched.
+  // The warning reads this and the switches read `observability`, because a switch flipped off stops
+  // recording when the save lands: a warning driven by the form goes quiet on the touch and tells
+  // the operator recording stopped while it is still running — and an operator who then leaves
+  // without saving takes that answer with them.
+  savedObservability: ObservabilityConfig;
+  // Whether the tenant asked for trace CONTENT to reach Langfuse. It is the third switch that
+  // widens what is recorded, it lives on another page entirely (Resources > Advanced), and it is
+  // therefore the one an operator forgets — so the warning here reads it too. Null while it is
+  // still loading, which reads as "not known yet" and never as "off".
+  langfuseSendContent: boolean | null;
   setLimits: React.Dispatch<React.SetStateAction<LimitsState>>;
   sendImage: SendImageState;
   setSendImage: React.Dispatch<React.SetStateAction<SendImageState>>;
@@ -587,16 +669,132 @@ function AttributeContextPickers({
   );
 }
 
+// Team a refused conversation is assigned to after the open. Fed by the same live listing the
+// handoff pinned-target picker uses, which only lists when the agent serves exactly ONE Chatwoot
+// account (teams are account-scoped). A stored id that is not in the listing still shows, so a
+// saved choice is never silently hidden.
+function ContactAuthTeamSelect({
+  agentId,
+  value,
+  onChange,
+}: {
+  agentId: string;
+  value: string;
+  // The team AND the account it came from: stored together, because the id alone means nothing
+  // outside it.
+  onChange: (teamId: string, instanceId: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [data, setData] = useState<{
+    teams: Array<{ id: number; name: string }>;
+    accountCount: number;
+    // Our ChatwootInstance id of the single account, when there is exactly one.
+    instanceId: string;
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data: d } = await api.api.v1.chatwoot["agents-teams"]({
+          agentId,
+        }).get();
+        if (!cancelled) {
+          setData(
+            d
+              ? {
+                  teams: d.teams,
+                  accountCount: d.accounts.length,
+                  instanceId: d.accounts[0]?.instanceId ?? "",
+                }
+              : { teams: [], accountCount: 0, instanceId: "" },
+          );
+        }
+      } catch {
+        if (!cancelled) setData({ teams: [], accountCount: 0, instanceId: "" });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  const teams = data?.teams ?? [];
+  const listed = teams.some((tm) => String(tm.id) === value);
+  // Populated only when the agent serves exactly one account, which is the only case the picker
+  // offers teams in.
+  const instanceId = data?.accountCount === 1 ? data.instanceId : "";
+  // A Chatwoot team id means something inside ONE account. When the agent serves several, the
+  // listing deliberately comes back empty, and keeping the stored id as a "(not listed)" option
+  // re-saved a target that the runtime then applies through EVERY account's client: in the other
+  // accounts that number is a different team or none, so refused contacts are routed nowhere.
+  // Cleared here rather than at save time, so the operator sees the field empty and the warning
+  // saying why, and still has to press save.
+  const multiAccount = data !== null && data.accountCount > 1;
+  useEffect(() => {
+    if (multiAccount && value) onChange("", "");
+  }, [multiAccount, value, onChange]);
+  return (
+    <FormField
+      label={t("editor.contactAuthTeam", "Assign to team")}
+      group
+      description={t(
+        "editor.contactAuthTeamHint",
+        "Optional. Without a team, Chatwoot's inbox routing decides who takes it.",
+      )}
+    >
+      <div className="flex flex-col gap-1.5">
+        <Select
+          value={value}
+          onChange={(e) => onChange(e.target.value, instanceId)}
+          aria-label={t("editor.contactAuthTeam", "Assign to team")}
+        >
+          <option value="">
+            {t("editor.contactAuthNoTeam", "No team (inbox routing)")}
+          </option>
+          {!listed && value && !multiAccount && (
+            <option value={value}>
+              {t("editor.contactAuthTeamStored", "Team #{{id}} (not listed)", {
+                id: value,
+              })}
+            </option>
+          )}
+          {teams.map((tm) => (
+            <option key={tm.id} value={String(tm.id)}>
+              {tm.name}
+            </option>
+          ))}
+        </Select>
+        {data && data.accountCount !== 1 && (
+          <span className="text-text-muted text-xs">
+            {data.accountCount === 0
+              ? t(
+                  "editor.handoffPinnedNoInbox",
+                  "Bind at least one inbox in the Channels tab first.",
+                )
+              : t(
+                  "editor.contactAuthTeamMultiAccount",
+                  "This agent serves more than one Chatwoot account. A team id belongs to one account, so no team can be targeted here — Chatwoot's inbox routing decides who takes a refused conversation.",
+                )}
+          </span>
+        )}
+      </div>
+    </FormField>
+  );
+}
+
 // The multi-step follow-up editor: an ordered list of step cards (delay + instructions + optional
 // label, and a resolve toggle on the LAST step). Labels are fetched once per agent from the inbox.
 function FollowUpStepsEditor({
   agentId,
   followUp,
   setFollowUp,
+  stepRefusals,
 }: {
   agentId: string;
   followUp: FollowUpState;
   setFollowUp: React.Dispatch<React.SetStateAction<FollowUpState>>;
+  // By index: the server refuses a note as `followUp.steps[2].instructions`, and the step it names is
+  // the one that has to carry the mark.
+  stepRefusals: readonly (string | null)[];
 }) {
   const { t } = useTranslation();
   const [labels, setLabels] = useState<InboxLabelOption[]>([]);
@@ -636,6 +834,7 @@ function FollowUpStepsEditor({
           instructions: "",
           assignLabels: [],
           resolve: false,
+          ignoreAppointmentPause: false,
         },
       ],
     }));
@@ -708,6 +907,7 @@ function FollowUpStepsEditor({
             </FormField>
             <FormField
               label={t("editor.followUpInstructions", "Follow-up instructions")}
+              error={stepRefusals[index] ?? null}
             >
               <Textarea
                 value={step.instructions}
@@ -738,6 +938,28 @@ function FollowUpStepsEditor({
                 ariaLabel={t("editor.followUpAssignLabel", "Assign label")}
               />
             </FormField>
+            {/* Only while the agent-wide pause is ON: with it off nothing pauses, so this switch
+                would decide nothing. Hidden is not off — the value is kept and saved either way. */}
+            {followUp.pauseWhileAppointment && (
+              <div className="flex flex-col gap-1.5">
+                <SwitchField
+                  checked={step.ignoreAppointmentPause}
+                  onCheckedChange={(v) =>
+                    updateStep(index, { ignoreAppointmentPause: v })
+                  }
+                  label={t(
+                    "editor.followUpIgnorePause",
+                    "Send this step even during an appointment",
+                  )}
+                />
+                <p className="text-text-muted text-xs">
+                  {t(
+                    "editor.followUpIgnorePauseHint",
+                    "Exempts THIS step from the pause below. Use it for a step that only means anything while the appointment stands, such as a payment deadline; the other steps keep waiting.",
+                  )}
+                </p>
+              </div>
+            )}
             {isLast && (
               <SwitchField
                 checked={step.resolve}
@@ -763,6 +985,7 @@ function FollowUpStepsEditor({
 
 export function BehaviorTab({
   agentId,
+  refusals,
   hours,
   businessHoursId,
   setBusinessHoursId,
@@ -777,6 +1000,8 @@ export function BehaviorTab({
   stt,
   setStt,
   sttCredBaseUrl,
+  contactAuth,
+  setContactAuth,
   tts,
   setTts,
   agentModelProvider,
@@ -792,7 +1017,13 @@ export function BehaviorTab({
   limits,
   memory,
   setMemory,
+  modelFallback,
+  setModelFallback,
+  modelFallbackCredBaseUrl,
+  memoryCredBaseUrl,
   observability,
+  savedObservability,
+  langfuseSendContent,
   setObservability,
   setLimits,
   sendImage,
@@ -823,6 +1054,90 @@ export function BehaviorTab({
     !sttCredBaseUrl &&
     !isValidHttpUrl(stt.baseURL);
 
+  // Required while the gate is on: an enabled gate with no reachable URL fails closed on every
+  // message, which is the whole agent going silent with nothing on screen to explain it. A URL
+  // carrying `user:pass@` is refused here for the same reason the reader refuses it (credentials
+  // belong in the vault); without this check the save would succeed and the runtime would read the
+  // field as unconfigured.
+  // The shared warning of #58. It reads all three switches that widen what is recorded, INCLUDING
+  // the tenant-level one that lives on another page, because an operator does not remember which of
+  // three unrelated screens they touched last week. Empty (falsy) when nothing is on, so the block
+  // renders only when there is something to say.
+  // The saved config was read at load or at save, and one of its fields STOPS BEING TRUE ON ITS OWN:
+  // the size switch expires. An editor left open past the deadline would otherwise keep saying full
+  // detail is being recorded while the runtime already stopped, which is the same lie as the one
+  // this warning was just fixed for, arriving by the clock instead of by a click. So the state is
+  // re-derived once, exactly when the window closes.
+  const [judgedAt, setJudgedAt] = useState(() => serverNowDate());
+  const savedUntilMs = savedObservability.fullDetailUntil?.getTime() ?? null;
+  const formUntilMs = observability.fullDetailUntil?.getTime() ?? null;
+  // The deadlines are TRIGGERS here, not reads: the body uses neither, and their changing is the
+  // whole signal.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: trigger, not a read
+  useEffect(() => {
+    // Re-judged whenever a deadline CHANGES, not only when one expires. A tab left open overnight
+    // still holds its mount-time instant, and a deadline armed 12h ahead of NOW reads as more than
+    // 24h ahead of THAT — so the reader's far-side bound would refuse it and the warning would stay
+    // silent for the whole window it was just armed for.
+    setJudgedAt(serverNowDate());
+  }, [savedUntilMs, formUntilMs]);
+  // `judgedAt` is a TRIGGER here, not a read: it is what re-runs this after a timer fires, so the
+  // next deadline gets scheduled.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: trigger, not a read
+  useEffect(() => {
+    // The next moment either answer changes: the saved deadline governs the warning, the form's
+    // governs the switch, and whichever comes first is when something on screen stops being true.
+    const next = [savedUntilMs, formUntilMs]
+      .filter((v): v is number => v !== null && v > serverNow())
+      .sort((a, b) => a - b)[0];
+    if (next === undefined) return;
+    const ms = next - serverNow();
+    // `setTimeout` saturates past ~24.9 days, and a delay it cannot represent fires IMMEDIATELY,
+    // which would read as an expiry that already happened. The window is bounded far below that,
+    // so this only ever guards a hand-written deadline.
+    if (ms > 2_147_483_647) return;
+    const timer = setTimeout(() => setJudgedAt(serverNowDate()), ms);
+    return () => clearTimeout(timer);
+    // `judgedAt` is a dependency so this re-runs AFTER a timer fires and schedules whatever comes
+    // next. Without it the effect arms the earlier of the two deadlines and then never runs again,
+    // because neither deadline changed — so a form deadline of 12h and a saved one of 20h would
+    // leave the warning standing after the saved window closed.
+  }, [savedUntilMs, formUntilMs, judgedAt]);
+
+  const debugModesOn = useMemo(() => {
+    // Through the shared derivation, never a second copy of the same `||`: a switch added to it
+    // would light the indicator everywhere except in the copy, and the copy is the one place the
+    // tests that cover that file cannot see.
+    const m = debugModesFrom(
+      savedObservability,
+      langfuseSendContent === true,
+      judgedAt,
+    );
+    if (!m.any) return null;
+    const on: string[] = [];
+    if (m.logToolValues)
+      on.push(t("editor.observabilityOnToolValues", "tool values"));
+    if (m.fullDetail)
+      on.push(t("editor.observabilityOnFullDetail", "full log detail"));
+    if (m.langfuseSendContent)
+      on.push(t("editor.observabilityOnLangfuse", "content sent to Langfuse"));
+    return on;
+  }, [savedObservability, langfuseSendContent, judgedAt, t]);
+
+  const contactAuthUrlHasCredentials = (() => {
+    try {
+      const u = new URL(contactAuth.url.trim());
+      return Boolean(u.username || u.password);
+    } catch {
+      return false;
+    }
+  })();
+  const contactAuthUrlInvalid =
+    contactAuth.enabled &&
+    (!contactAuth.url.trim() ||
+      !isValidHttpUrl(contactAuth.url) ||
+      contactAuthUrlHasCredentials);
+
   const visionBaseUrlInvalid =
     vision.enabled &&
     vision.provider === "openai-compatible" &&
@@ -847,6 +1162,86 @@ export function BehaviorTab({
   // still runs against an endpoint, and hiding that field made it un-inspectable.
   const normalizeEffectiveProvider =
     tts.normalizeProvider || agentModelProvider;
+
+  // The summarizer's model, resolved the SAME way, through the shared projection rather than a
+  // second copy of the rule.
+  const memoryOverride = {
+    provider: memory.provider,
+    model: memory.model,
+    credentialRef: memory.credentialRef,
+    baseURL: memory.baseURL,
+  };
+  const memorySource = overridePickerSource(
+    memoryOverride,
+    agentModel,
+    memoryCredBaseUrl,
+  );
+  const memoryEffectiveProvider = memory.provider || agentModelProvider;
+  const memoryNeedsOwnCredential = overrideNeedsOwnCredential(
+    memoryOverride,
+    agentModel,
+    memoryCredBaseUrl,
+  );
+  // The endpoint half of the same resolution, and the reason it is here rather than only on the
+  // field: the summariser is the second override in this tab, and the first one already blocks the
+  // save on both of these. A section that renders the picker without them saves a configuration the
+  // runtime refuses, and the operator's only signal is attendances quietly staying raw.
+  const memoryBaseUrlInvalid = overrideBaseUrlInvalid(
+    memoryOverride,
+    agentModel,
+    memoryCredBaseUrl,
+    memory.compactionEnabled,
+  );
+  const memoryBaseUrlUnsupported = overrideBaseUrlUnsupported(
+    memoryOverride,
+    agentModel,
+    memoryCredBaseUrl,
+    memory.compactionEnabled,
+  );
+  const fallbackOverride = {
+    provider: modelFallback.provider,
+    model: modelFallback.model,
+    credentialRef: modelFallback.credentialRef,
+    baseURL: modelFallback.baseURL,
+  };
+  // A fallback is CONFIGURED once a destination is named, and that is the flag every check below
+  // reads — including the endpoint ones, which is why it has to agree with the backend rather than
+  // approximate it. Written as "both halves are named", it answered NO for a model-less
+  // `openai-compatible` fallback, which the backend calls configured: the base-URL checks switched
+  // themselves off, Save went through on a missing or malformed endpoint, the server stored it, and
+  // the runtime could not build it. Same rule, same predicate, one place.
+  const fallbackConfigured = fallbackIsConfigured(modelFallback);
+  // Named, and on the save gate, because the round trip does not survive it: `modelFallbackToStored`
+  // persists `{provider: "openai", model: null}`, `hasModelFallback` answers false, and the form
+  // reader maps that straight back to "No fallback" — so the provider the operator picked is gone on
+  // the next load with nothing on screen to say why. The write boundary refuses it too
+  // (`assertSettingsModelFallback`, which is what covers the MCP patch); this is what keeps the
+  // operator from meeting that refusal as a 400 on a button they were never stopped from pressing.
+  const fallbackModelMissing = fallbackModelIsMissing(modelFallback);
+  const fallbackSource = overridePickerSource(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+  );
+  const fallbackEffectiveProvider =
+    modelFallback.provider || agentModelProvider;
+  const fallbackNeedsOwnCredential = overrideNeedsOwnCredential(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+  );
+  const fallbackBaseUrlInvalid = overrideBaseUrlInvalid(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+    fallbackConfigured,
+  );
+  const fallbackBaseUrlUnsupported = overrideBaseUrlUnsupported(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+    fallbackConfigured,
+  );
   const normalizeBaseUrlInvalid = ttsNormalizerBaseUrlInvalid(
     tts,
     agentModel,
@@ -917,6 +1312,14 @@ export function BehaviorTab({
       icon: ImagePlus,
       label: t("editor.sendImage", "Sending images"),
     },
+    // Last of the behaviour sections and before the operational ones: most agents never turn this
+    // on, so it does not belong above the grouping/audio/memory settings every agent uses — but it
+    // decides whether the agent speaks at all, so it does not belong at the very bottom either.
+    {
+      id: "contactAuth",
+      icon: ShieldCheck,
+      label: t("editor.contactAuth", "Contact authorization"),
+    },
     {
       id: "limits",
       icon: Gauge,
@@ -926,6 +1329,11 @@ export function BehaviorTab({
       id: "memory",
       icon: Brain,
       label: t("editor.memory", "Memory"),
+    },
+    {
+      id: "modelFallback",
+      icon: LifeBuoy,
+      label: t("editor.modelFallback", "Fallback provider"),
     },
     {
       id: "observability",
@@ -979,6 +1387,7 @@ export function BehaviorTab({
             {awayEnabled && (
               <FormField
                 label={t("editor.awayMessage", "Out-of-hours message")}
+                error={refusals.awayMessage}
                 description={t(
                   "editor.awayMessageHint",
                   'Sent to the customer while the agent is outside these hours, at most once a day per conversation. Write {next_open} (or {proximo_atendimento} for a Portuguese message) where the next opening should appear: the customer reads something like "Monday, 08/25, 09:00".',
@@ -1115,7 +1524,11 @@ export function BehaviorTab({
                       ))}
                     </Select>
                   </FormField>
-                  <FormField label={t("editor.sttCredential", "API key")} group>
+                  <FormField
+                    label={t("editor.sttCredential", "API key")}
+                    error={refusals.sttCredential}
+                    group
+                  >
                     <CredentialPicker
                       value={stt.credentialRef}
                       onChange={(v) => setStt({ ...stt, credentialRef: v })}
@@ -1234,7 +1647,22 @@ export function BehaviorTab({
             {vision.enabled && (
               <>
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <FormField label={t("editor.visionProvider", "Provider")}>
+                  <FormField
+                    label={t("editor.visionProvider", "Provider")}
+                    // Said here, and not only in the docs, because the alternative way to learn it
+                    // is a PDF that comes back unextracted mid-attendance (issue #324).
+                    hint={
+                      visionAcceptsDocuments(
+                        vision.provider,
+                        visionCredBaseUrl ?? vision.baseURL,
+                      )
+                        ? undefined
+                        : t(
+                            "editor.visionImageOnly",
+                            "PDF attachments are skipped with this setup; only images are read.",
+                          )
+                    }
+                  >
                     <Select
                       value={vision.provider}
                       onChange={(e) =>
@@ -1250,6 +1678,7 @@ export function BehaviorTab({
                   </FormField>
                   <FormField
                     label={t("editor.visionCredential", "API key")}
+                    error={refusals.visionCredential}
                     group
                   >
                     <CredentialPicker
@@ -1269,9 +1698,13 @@ export function BehaviorTab({
                 <FormField
                   label={t("editor.visionModel", "Model")}
                   group
+                  // The per-provider sentence used to live here, as a static list naming which
+                  // providers read PDFs. It went stale the moment one of them changed (issue #324),
+                  // and it was in the wrong field anyway: what a provider reads is a property of the
+                  // provider, so it is said above, next to the provider.
                   description={t(
                     "editor.visionModelHint",
-                    "Leave blank for the provider default. OpenAI reads images only; Gemini and Anthropic also read PDFs.",
+                    "Leave blank for the provider default.",
                   )}
                 >
                   <ModelPicker
@@ -1316,6 +1749,7 @@ export function BehaviorTab({
                   </FormField>
                 )}
                 <FormField
+                  error={refusals.visionExtractionPrompt}
                   label={
                     <span className="flex items-center justify-between gap-2">
                       <span>
@@ -1402,7 +1836,11 @@ export function BehaviorTab({
                       ))}
                     </Select>
                   </FormField>
-                  <FormField label={t("editor.ttsCredential", "API key")} group>
+                  <FormField
+                    label={t("editor.ttsCredential", "API key")}
+                    error={refusals.ttsCredential}
+                    group
+                  >
                     <CredentialPicker
                       value={tts.credentialRef}
                       onChange={(v) => setTts({ ...tts, credentialRef: v })}
@@ -1519,6 +1957,7 @@ export function BehaviorTab({
                     </FormField>
                     <FormField
                       label={t("editor.credential", "API key")}
+                      error={refusals.ttsNormalizeCredential}
                       description={t(
                         "editor.ttsNormalizeCredentialHint",
                         "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own the rewrite is skipped and the audio goes out unrewritten.",
@@ -1885,6 +2324,248 @@ export function BehaviorTab({
           </Section>
 
           <Section
+            id="contactAuth"
+            icon={ShieldCheck}
+            title={t("editor.contactAuth", "Contact authorization")}
+            description={t(
+              "editor.contactAuthHint",
+              "Before answering, ask an external system whether this contact may be served, by the identity Chatwoot holds for them (phone, email, identifier). By default every message is re-checked, so revoking on your side takes effect immediately. While the check denies or cannot answer, the agent stays silent to the customer and the operator gets a private note. It does not run in the playground.",
+            )}
+          >
+            <SwitchField
+              checked={contactAuth.enabled}
+              onCheckedChange={(v) =>
+                setContactAuth({ ...contactAuth, enabled: v })
+              }
+              label={t(
+                "editor.contactAuthEnabled",
+                "Only answer contacts the external check authorizes",
+              )}
+            />
+            {contactAuth.enabled && (
+              <>
+                <FormField
+                  label={t("editor.contactAuthUrl", "Authorization URL")}
+                  description={t(
+                    "editor.contactAuthUrlHint",
+                    'Receives a POST with the identity in a JSON body (contact, conversation, message) and answers { "authorized": true | false }.',
+                  )}
+                  error={
+                    contactAuthUrlInvalid
+                      ? t(
+                          "editor.contactAuthUrlInvalid",
+                          "Required: a valid http(s) URL, with any credential in the vault rather than in the URL.",
+                        )
+                      : null
+                  }
+                >
+                  <Input
+                    value={contactAuth.url}
+                    onChange={(e) =>
+                      setContactAuth({ ...contactAuth, url: e.target.value })
+                    }
+                    placeholder="https://api.example.com/contacts/authorize"
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.contactAuthCredential", "Credential")}
+                  error={refusals.contactAuthCredential}
+                  group
+                  description={t(
+                    "editor.contactAuthCredentialHint",
+                    "Optional. Sent the way the credential's type declares (Bearer, header or query parameter).",
+                  )}
+                >
+                  <CredentialPicker
+                    value={contactAuth.credentialRef}
+                    onChange={(v) =>
+                      setContactAuth({ ...contactAuth, credentialRef: v })
+                    }
+                    compatibleTypes={[
+                      "bearer_token",
+                      "header",
+                      "query",
+                      "basic_auth",
+                    ]}
+                    defaultCreateType="bearer_token"
+                    ariaLabel={t("editor.contactAuthCredential", "Credential")}
+                  />
+                </FormField>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    label={t("editor.contactAuthTimeout", "Timeout (ms)")}
+                    description={t(
+                      "editor.contactAuthTimeoutHint",
+                      "1,000-10,000. Past it the check counts as failed and the agent stays silent.",
+                    )}
+                  >
+                    <Input
+                      type="number"
+                      min={1000}
+                      max={10000}
+                      value={contactAuth.timeoutMs}
+                      onChange={(e) =>
+                        setContactAuth({
+                          ...contactAuth,
+                          timeoutMs: e.target.value,
+                        })
+                      }
+                    />
+                  </FormField>
+                  <FormField
+                    label={t(
+                      "editor.contactAuthNoticeCooldown",
+                      "Notice cooldown (s)",
+                    )}
+                    description={t(
+                      "editor.contactAuthNoticeCooldownHint",
+                      "This only spaces the deny message and the private note for the same conversation; it never spaces the check itself. 0-3,600; 0 notifies on every refused message.",
+                    )}
+                  >
+                    <Input
+                      type="number"
+                      min={0}
+                      max={3600}
+                      value={contactAuth.noticeCooldownSeconds}
+                      onChange={(e) =>
+                        setContactAuth({
+                          ...contactAuth,
+                          noticeCooldownSeconds: e.target.value,
+                        })
+                      }
+                    />
+                  </FormField>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <SwitchField
+                    checked={contactAuth.includeMessageText}
+                    onCheckedChange={(v) =>
+                      setContactAuth({ ...contactAuth, includeMessageText: v })
+                    }
+                    label={t(
+                      "editor.contactAuthIncludeText",
+                      "Send the customer's message text",
+                    )}
+                  />
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "editor.contactAuthIncludeTextHint",
+                      "The triggering message travels as its own message.text field, apart from the mirrored identity, so your endpoint can accept an unlock code the customer sends. It is never logged.",
+                    )}
+                  </p>
+                </div>
+                <FormField
+                  label={t(
+                    "editor.contactAuthMode",
+                    "How often the endpoint is asked",
+                  )}
+                  description={t(
+                    "editor.contactAuthModeHint",
+                    "Every message is the default: your endpoint owns the answer, so revoking there takes effect on the contact's next message. Reusing calls it until it first says yes, which suits an expensive endpoint and an unlock flow.",
+                  )}
+                >
+                  <Select
+                    value={contactAuth.mode}
+                    onChange={(e) =>
+                      setContactAuth({ ...contactAuth, mode: e.target.value })
+                    }
+                  >
+                    <option value="perMessage">
+                      {t(
+                        "editor.contactAuthModePerMessage",
+                        "On every message (recommended)",
+                      )}
+                    </option>
+                    <option value="once">
+                      {t(
+                        "editor.contactAuthModeOnce",
+                        "Once per contact, then reuse the answer",
+                      )}
+                    </option>
+                  </Select>
+                </FormField>
+                {contactAuth.mode === "once" && (
+                  <FormField
+                    label={t(
+                      "editor.contactAuthGrantTtl",
+                      "Reuse the answer for (s)",
+                    )}
+                    description={t(
+                      "editor.contactAuthGrantTtlHint",
+                      "60-2,592,000 (30 days). A refusal is never stored, and a stored answer stops counting when the contact's phone, email or identifier changes. Changing this field, the URL or the credential only suspends the stored answers while the new value stands: it is not a way to clear them. To stop reusing altogether, switch back to asking on every message.",
+                    )}
+                  >
+                    <Input
+                      type="number"
+                      min={60}
+                      max={2592000}
+                      value={contactAuth.grantTtlSeconds}
+                      onChange={(e) =>
+                        setContactAuth({
+                          ...contactAuth,
+                          grantTtlSeconds: e.target.value,
+                        })
+                      }
+                    />
+                  </FormField>
+                )}
+                <FormField
+                  label={t(
+                    "editor.contactAuthDenyMessage",
+                    "Message to a denied contact",
+                  )}
+                  error={refusals.contactAuthDenyMessage}
+                  description={t(
+                    "editor.contactAuthDenyMessageHint",
+                    "Sent when the check denies the contact, at most once per notice cooldown. Leave empty to send nothing.",
+                  )}
+                >
+                  <Textarea
+                    value={contactAuth.denyMessage}
+                    onChange={(e) =>
+                      setContactAuth({
+                        ...contactAuth,
+                        denyMessage: e.target.value,
+                      })
+                    }
+                    rows={2}
+                    maxLength={TEMPLATE_MESSAGE_MAX}
+                    placeholder={t(
+                      "editor.contactAuthDenyMessagePlaceholder",
+                      "This channel serves registered customers only.",
+                    )}
+                  />
+                </FormField>
+                <SwitchField
+                  checked={contactAuth.handoffEnabled}
+                  onCheckedChange={(v) =>
+                    setContactAuth({ ...contactAuth, handoffEnabled: v })
+                  }
+                  label={t(
+                    "editor.contactAuthHandoff",
+                    "Open refused conversations for humans",
+                  )}
+                />
+                {contactAuth.handoffEnabled && (
+                  <ContactAuthTeamSelect
+                    agentId={agentId}
+                    value={contactAuth.handoffTeamId}
+                    onChange={(v, instanceId) =>
+                      setContactAuth({
+                        ...contactAuth,
+                        handoffTeamId: v,
+                        // Cleared with the team: a recorded account with no team pins nothing, and
+                        // a stale one would outlive the choice it belonged to.
+                        handoffTeamInstanceId: v ? instanceId : "",
+                      })
+                    }
+                  />
+                )}
+              </>
+            )}
+          </Section>
+
+          <Section
             id="limits"
             icon={Gauge}
             title={t("editor.limits", "Execution limits")}
@@ -1938,17 +2619,341 @@ export function BehaviorTab({
             title={t("editor.memory", "Memory")}
             description={t(
               "editor.memoryHint",
-              'The agent remembers every conversation it has had with this contact on this channel. When an attendance ends, its messages are replaced by a summary of it, so the memory becomes "N summarized attendances + the current one". What survives a summary is the useful part: who the contact is, what was agreed, what was left open. Exact wording does not, so turn this off if the agent must be able to quote an old conversation word for word. The summary is written by the agent\'s own model, after the reply is sent, so no customer waits for it.',
+              'The agent remembers every conversation it has had with this contact on this channel. When an attendance ends, its messages are replaced by a summary of it, so the memory becomes "N summarized attendances + the current one". What survives a summary is the useful part: who the contact is, what was agreed, what was left open. Exact wording does not, so turn this off if the agent must be able to quote an old conversation word for word. The summary is written by the agent\'s own model, after the reply is sent, so no customer waits for it. It runs once for every attendance that ends, including the ones your team handled without the agent.',
             )}
           >
             <SwitchField
               checked={memory.compactionEnabled}
-              onCheckedChange={(v) => setMemory({ compactionEnabled: v })}
+              onCheckedChange={(v) =>
+                setMemory((prev) => ({ ...prev, compactionEnabled: v }))
+              }
               label={t(
                 "editor.memoryCompaction",
                 "Summarize attendances that have ended",
               )}
             />
+            {memory.compactionEnabled && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <p className="font-medium text-sm">
+                    {t("editor.memoryModel", "Summary model")}
+                  </p>
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "editor.memoryModelHint",
+                      "Leave it on the agent's model to change nothing. This is the one place where a cheaper model is usually the wrong trade: the summary is not read once, it becomes what the agent knows about this contact from then on, it is never rewritten, and a weaker model tends to drop the customer's name while writing more. Measured on one vendor's cheapest model: the name was lost on one attendance in five. Change it only with a model you have compared yourself.",
+                    )}
+                  </p>
+                </div>
+                <FormField label={t("editor.provider", "Provider")}>
+                  <Select
+                    value={memory.provider}
+                    onChange={(e) =>
+                      setMemory((prev) => ({
+                        ...prev,
+                        ...overrideProviderChanged(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          e.target.value,
+                        ),
+                      }))
+                    }
+                  >
+                    <option value="">
+                      {t("editor.memorySameAsAgent", "Same as the agent")}
+                    </option>
+                    {MODEL_PROVIDERS.map((p) => (
+                      <option key={p} value={p}>
+                        {providerLabel(p, t)}
+                      </option>
+                    ))}
+                  </Select>
+                </FormField>
+                <FormField
+                  label={t("editor.credential", "API key")}
+                  error={refusals.memoryCredential}
+                  description={t(
+                    "editor.memoryCredentialHint",
+                    "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own the summary is not written and the attendance stays in the thread raw.",
+                  )}
+                  group
+                >
+                  <CredentialPicker
+                    value={memory.credentialRef}
+                    onChange={(v) =>
+                      setMemory((prev) => ({
+                        ...prev,
+                        ...overridePicked(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          "credentialRef",
+                          v,
+                          agentModelProvider,
+                        ),
+                      }))
+                    }
+                    required={memoryNeedsOwnCredential}
+                    compatibleTypes={credentialCompat.model(
+                      memoryEffectiveProvider,
+                    )}
+                    defaultCreateType={
+                      credentialCompat.model(memoryEffectiveProvider)[0]
+                    }
+                    ariaLabel={t("editor.credential", "API key")}
+                  />
+                </FormField>
+                <FormField label={t("editor.model", "Model")} group>
+                  <ModelPicker
+                    value={memory.model}
+                    onChange={(v) =>
+                      setMemory((prev) => ({
+                        ...prev,
+                        ...overridePicked(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          "model",
+                          v,
+                          agentModelProvider,
+                        ),
+                      }))
+                    }
+                    provider={memoryEffectiveProvider}
+                    credentialRef={memorySource.credentialRef || undefined}
+                    baseURL={memorySource.baseURL || undefined}
+                    // NOTE: blank inherits the AGENT's model while the provider is unchanged, and
+                    // only falls back to the provider default once it differs. The placeholder has
+                    // to say the same thing, or the operator reads one model here and another runs.
+                    placeholder={
+                      memoryEffectiveProvider === agentModelProvider
+                        ? t("editor.memorySameAsAgent", "Same as the agent")
+                        : undefined
+                    }
+                  />
+                </FormField>
+                {(memoryEffectiveProvider === "openai-compatible" ||
+                  !!memoryCredBaseUrl ||
+                  !!memory.baseURL.trim()) && (
+                  <FormField
+                    label={t("editor.baseURL", "Base URL")}
+                    description={
+                      memoryCredBaseUrl
+                        ? t(
+                            "editor.baseURLFromCredential",
+                            "Defined by the selected credential.",
+                          )
+                        : t(
+                            "editor.memoryBaseURLHint",
+                            "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
+                          )
+                    }
+                    error={
+                      memoryBaseUrlUnsupported
+                        ? t(
+                            "editor.baseURLNotSentByProvider",
+                            "This provider does not send a base URL: the request would go to its own endpoint instead. Pick a credential without one, or use an OpenAI-compatible provider.",
+                          )
+                        : memoryBaseUrlInvalid && memory.baseURL.trim()
+                          ? t(
+                              "common.invalidUrl",
+                              "Must be a valid http(s) URL.",
+                            )
+                          : null
+                    }
+                  >
+                    <Input
+                      value={memoryCredBaseUrl ?? memory.baseURL}
+                      onChange={(e) =>
+                        setMemory((prev) => ({
+                          ...prev,
+                          baseURL: e.target.value,
+                        }))
+                      }
+                      disabled={!!memoryCredBaseUrl}
+                      placeholder="https://api.groq.com/openai/v1"
+                    />
+                  </FormField>
+                )}
+              </div>
+            )}
+          </Section>
+
+          <Section
+            id="modelFallback"
+            icon={LifeBuoy}
+            title={t("editor.modelFallback", "Fallback provider")}
+            description={t(
+              "editor.modelFallbackHint",
+              "Where a turn goes when the agent's own provider cannot take it: rate-limited, overloaded, or not answering. Only those. A key the provider rejected, a model id it does not know, or a request it refused are NOT failed over, because the second provider would answer them fine and you would never find out the first one is broken \u2014 you would just be billed by both. Leave it empty and nothing changes: a turn that fails today keeps failing the same way.",
+            )}
+          >
+            <FormField
+              label={t("editor.provider", "Provider")}
+              description={t(
+                "editor.modelFallbackProviderHint",
+                "Pick a different vendor than the agent's whenever you can. The same vendor rate-limits your account as a whole, so a second model there is usually down for the same reason at the same moment.",
+              )}
+            >
+              <Select
+                value={modelFallback.provider}
+                onChange={(e) =>
+                  setModelFallback((prev) => ({
+                    ...prev,
+                    ...overrideProviderChanged(
+                      {
+                        provider: prev.provider,
+                        model: prev.model,
+                        credentialRef: prev.credentialRef,
+                        baseURL: prev.baseURL,
+                      },
+                      e.target.value,
+                    ),
+                  }))
+                }
+              >
+                <option value="">
+                  {t("editor.modelFallbackNone", "No fallback")}
+                </option>
+                {MODEL_PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {providerLabel(p, t)}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+            {!!modelFallback.provider && (
+              <div className="flex flex-col gap-3">
+                <FormField
+                  error={refusals.modelFallbackCredential}
+                  label={t("editor.credential", "API key")}
+                  description={t(
+                    "editor.modelFallbackCredentialHint",
+                    "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own there is nothing behind the provider and the turn fails as it would with no fallback at all.",
+                  )}
+                  group
+                >
+                  <CredentialPicker
+                    value={modelFallback.credentialRef}
+                    onChange={(v) =>
+                      setModelFallback((prev) => ({
+                        ...prev,
+                        ...overridePicked(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          "credentialRef",
+                          v,
+                          agentModelProvider,
+                        ),
+                      }))
+                    }
+                    required={fallbackNeedsOwnCredential}
+                    compatibleTypes={credentialCompat.model(
+                      fallbackEffectiveProvider,
+                    )}
+                    defaultCreateType={
+                      credentialCompat.model(fallbackEffectiveProvider)[0]
+                    }
+                    ariaLabel={t("editor.credential", "API key")}
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.model", "Model")}
+                  // The same predicate the save gate reads, so the red field and the disabled button
+                  // cannot drift apart: a provider with no model stores cleanly, comes back as "No
+                  // fallback", and builds nothing.
+                  error={
+                    fallbackModelMissing
+                      ? t(
+                          "editor.modelFallbackModelRequired",
+                          "Pick a model, or the fallback is saved and never runs.",
+                        )
+                      : null
+                  }
+                  group
+                >
+                  <ModelPicker
+                    value={modelFallback.model}
+                    onChange={(v) =>
+                      setModelFallback((prev) => ({
+                        ...prev,
+                        ...overridePicked(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          "model",
+                          v,
+                          agentModelProvider,
+                        ),
+                      }))
+                    }
+                    provider={fallbackEffectiveProvider}
+                    credentialRef={fallbackSource.credentialRef || undefined}
+                    baseURL={fallbackSource.baseURL || undefined}
+                  />
+                </FormField>
+                {(fallbackEffectiveProvider === "openai-compatible" ||
+                  !!modelFallbackCredBaseUrl ||
+                  !!modelFallback.baseURL.trim()) && (
+                  <FormField
+                    label={t("editor.baseURL", "Base URL")}
+                    description={
+                      modelFallbackCredBaseUrl
+                        ? t(
+                            "editor.baseURLFromCredential",
+                            "Defined by the selected credential.",
+                          )
+                        : t(
+                            "editor.modelFallbackBaseURLHint",
+                            "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
+                          )
+                    }
+                    error={
+                      fallbackBaseUrlUnsupported
+                        ? t(
+                            "editor.baseURLNotSentByProvider",
+                            "This provider does not send a base URL: the request would go to its own endpoint instead. Pick a credential without one, or use an OpenAI-compatible provider.",
+                          )
+                        : fallbackBaseUrlInvalid && modelFallback.baseURL.trim()
+                          ? t(
+                              "common.invalidUrl",
+                              "Must be a valid http(s) URL.",
+                            )
+                          : null
+                    }
+                  >
+                    <Input
+                      value={modelFallbackCredBaseUrl ?? modelFallback.baseURL}
+                      onChange={(e) =>
+                        setModelFallback((prev) => ({
+                          ...prev,
+                          baseURL: e.target.value,
+                        }))
+                      }
+                      disabled={!!modelFallbackCredBaseUrl}
+                      placeholder="https://..."
+                    />
+                  </FormField>
+                )}
+              </div>
+            )}
           </Section>
 
           <Section
@@ -1960,14 +2965,88 @@ export function BehaviorTab({
               'By default a tool line on the Logs page records the SHAPE of each argument and result ({ cpf: "string(11)" }): enough to see which arguments the agent sent, which it left out and whether a format is wrong, with no customer data. Turning the switch on records the values themselves, which is what answers which record it actually looked up, and keeps those values for the whole log retention window, including in every log export. Turn it on while investigating, off afterwards.',
             )}
           >
+            {debugModesOn && (
+              <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+                <AlertTriangle
+                  className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                  aria-hidden="true"
+                />
+                <span>
+                  {t(
+                    "editor.observabilityDebugOn",
+                    "Recording more than the default right now:",
+                  )}{" "}
+                  {debugModesOn.join(" · ")}
+                </span>
+              </div>
+            )}
             <SwitchField
               checked={observability.logToolValues}
-              onCheckedChange={(v) => setObservability({ logToolValues: v })}
+              onCheckedChange={(v) =>
+                setObservability((o) => ({ ...o, logToolValues: v }))
+              }
               label={t(
                 "editor.observabilityLogToolValues",
                 "Log the values sent to tools",
               )}
             />
+            <SwitchField
+              // Derived, not read off the form: `fullDetail` was computed when the config was read,
+              // and the one thing it describes turns itself off. A switch frozen at that answer
+              // stays checked past its own deadline and shows a hint naming a moment that has gone,
+              // and re-arming then takes two clicks because the first only sets it to what it
+              // already claims to be.
+              checked={isFullDetailWindowOpen(
+                observability.fullDetailUntil,
+                judgedAt,
+              )}
+              onCheckedChange={(v) =>
+                setObservability((o) => ({
+                  ...o,
+                  fullDetail: v,
+                  // The stored value IS the end of the window, so turning the switch on is choosing
+                  // an instant. It cannot be armed for longer than the schema accepts, and it stops
+                  // on its own, which is the point: an operator who forgets loses at most one day of
+                  // full-size rows instead of the whole retention window.
+                  //
+                  // Chosen on the SERVER's clock, because the server is what enforces it. Off the
+                  // browser's, a wrong machine arms a window of a different length than the one the
+                  // screen names, and a machine wrong by more than the arming gap arms one that was
+                  // already over.
+                  fullDetailUntil: v
+                    ? new Date(serverNow() + FULL_DETAIL_ARM_HOURS * 3_600_000)
+                    : null,
+                }))
+              }
+              label={t(
+                "editor.observabilityFullDetail",
+                "Store log detail in full (expires on its own)",
+              )}
+            />
+            <p className="text-text-secondary text-xs">
+              {/* Which of the two sentences depends on whether this deadline is the SAVED one.
+                  Both are "the window is open until X", and only the unsaved one is waiting on a
+                  click: an armed-and-saved window that kept saying "Save to apply" contradicted the
+                  warning above it, which speaks for the server, and left an operator no way to tell
+                  a mode that is running from one that is merely typed. */}
+              {isFullDetailWindowOpen(observability.fullDetailUntil, judgedAt)
+                ? formUntilMs === savedUntilMs
+                  ? t("editor.observabilityFullDetailUntil", {
+                      defaultValue: "On until {{when}}.",
+                      when:
+                        observability.fullDetailUntil?.toLocaleString() ?? "",
+                    })
+                  : t("editor.observabilityFullDetailUntilUnsaved", {
+                      defaultValue: "On until {{when}} once you save.",
+                      when:
+                        observability.fullDetailUntil?.toLocaleString() ?? "",
+                    })
+                : t("editor.observabilityFullDetailHint", {
+                    defaultValue:
+                      "A log line cuts every stored string at 2,000 characters, which is where a long system prompt stops being readable on the Logs page. This keeps them whole for the next {{hours}}h, then goes back to cutting them without anyone having to remember.",
+                    hours: FULL_DETAIL_ARM_HOURS,
+                  })}
+            </p>
           </Section>
 
           <Section
@@ -2063,6 +3142,7 @@ export function BehaviorTab({
                     />
                   </FormField>
                   <FollowUpStepsEditor
+                    stepRefusals={refusals.followUpSteps}
                     agentId={agentId}
                     followUp={followUp}
                     setFollowUp={setFollowUp}
@@ -2189,10 +3269,16 @@ export function BehaviorTab({
         onSave={onSave}
         onDiscard={onDiscard}
         saveDisabled={
+          contactAuthUrlInvalid ||
           sttBaseUrlInvalid ||
           visionBaseUrlInvalid ||
           normalizeBaseUrlInvalid ||
-          normalizeBaseUrlUnsupported
+          normalizeBaseUrlUnsupported ||
+          memoryBaseUrlInvalid ||
+          memoryBaseUrlUnsupported ||
+          fallbackBaseUrlInvalid ||
+          fallbackBaseUrlUnsupported ||
+          fallbackModelMissing
         }
         onOpenPlayground={onOpenPlayground}
       />

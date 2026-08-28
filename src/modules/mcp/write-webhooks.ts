@@ -1,6 +1,7 @@
 import type { InboundAuthStrategy } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
+import { truncForAudit } from "@/modules/audit/projection";
 import {
   createAlertChannel,
   deleteAlertChannel,
@@ -9,11 +10,16 @@ import {
 } from "@/modules/flowlog/channels";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import {
+  assertUsableHeaderNames,
   createIntegrationInstance,
   deleteIntegrationInstance,
   getIntegrationInstance,
   updateIntegrationInstance,
 } from "@/modules/integrations/service";
+import {
+  getWebhookDelivery,
+  requeueWebhookDelivery,
+} from "@/modules/webhooks/outbound/deliveries";
 import { isOutboundEvent } from "@/modules/webhooks/outbound/events";
 import {
   createWebhookSubscription,
@@ -29,10 +35,10 @@ import {
   err,
   gate,
   ok,
+  parseMcpId,
   recordMcpAudit,
   resolveSecretRef,
   resolveSecretValue,
-  truncForAudit,
   type WriteDeps,
   type WriteResult,
 } from "./write";
@@ -46,14 +52,6 @@ import {
 function failOf(e: unknown): WriteResult {
   if (e instanceof AppError) return err(e.message);
   throw e;
-}
-
-function parseId(raw: string, label: string): bigint | WriteResult {
-  try {
-    return BigInt(raw);
-  } catch {
-    return err(`invalid ${label}`);
-  }
 }
 
 // ── outbound webhooks ──
@@ -109,7 +107,7 @@ export async function webhookCreate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.webhook_create",
+      action: "webhook.create",
       target: `webhook:${created.id}`,
       before: null,
       after: truncForAudit({
@@ -141,7 +139,7 @@ export async function webhookUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.webhook_id, "webhook_id");
+  const id = parseMcpId(args.webhook_id, "webhook_id");
   if (typeof id !== "bigint") return id;
   if (args.events) {
     const bad = args.events.filter((e) => !isOutboundEvent(e));
@@ -192,7 +190,7 @@ export async function webhookUpdate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.webhook_update",
+      action: "webhook.update",
       target,
       before: truncForAudit(beforeProj),
       after: truncForAudit({
@@ -215,7 +213,7 @@ export async function webhookDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.webhook_id, "webhook_id");
+  const id = parseMcpId(args.webhook_id, "webhook_id");
   if (typeof id !== "bigint") return id;
   try {
     const all = await listWebhookSubscriptions(ctx, base);
@@ -239,12 +237,86 @@ export async function webhookDelete(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.webhook_delete",
+      action: "webhook.delete",
       target,
       before: truncForAudit(beforeProj),
       after: null,
     });
     return ok({ dryRun: false, applied: true, target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// Put a DEAD outbound delivery back in the worker's queue (issue #305). The state change is the
+// service's; what this adds is the MCP contract around it.
+//
+// The dry run READS THE ROW instead of echoing the argument back, and that is the whole point of
+// it here: the only way this call fails is the row not being DEAD, so a preview built from the id
+// alone would approve exactly the requests the apply refuses. It answers with the same refusal, on
+// the same read, one step earlier.
+export async function webhookDeliveryRequeue(
+  principal: VerifiedToken,
+  args: { delivery_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const id = parseMcpId(args.delivery_id, "delivery_id");
+  if (typeof id !== "bigint") return id;
+  const target = `webhook_delivery:${id}`;
+  try {
+    // The preview reads the row; the APPLY does not. They are different questions: a preview says
+    // what would happen if the write ran now, and an unlocked read is the only thing it can say it
+    // from — while an apply that repeated that read would refuse cases the service accepts. The
+    // worker turning SENDING into DEAD is the case: uncommitted, it still reads SENDING here, and
+    // the service is built to wait on that transition and requeue the row that comes out of it.
+    // So the apply defers to the locked check, and its refusal is the service's own.
+    if (args.dry_run !== false) {
+      const current = await getWebhookDelivery(ctx, id, base);
+      if (current.status !== "DEAD")
+        return err(
+          `only a dead delivery can be requeued (this one is ${current.status})`,
+        );
+      return ok({
+        dryRun: true,
+        action: "requeue",
+        target,
+        current: {
+          id: current.id,
+          status: current.status,
+          attempts: current.attempts,
+          event: current.event,
+          subscriptionId: current.subscriptionId,
+          subscriptionEnabled: current.subscriptionEnabled,
+        },
+        // Named rather than implied: `attempts` going back to 0 is what buys a full retry ladder
+        // instead of a single post, and a disabled subscription means the queue holds the row.
+        preview: {
+          status: "PENDING",
+          attempts: 0,
+          willBeClaimed: current.subscriptionEnabled,
+        },
+      });
+    }
+    // `before` is the service's own LOCKED read, which is what makes the audit describe the write
+    // that happened: any read this tool took first would be one the row can move away from, and
+    // for a URL the SSRF guard refuses that takes a single tick.
+    const { delivery: after, before } = await requeueWebhookDelivery(
+      ctx,
+      id,
+      base,
+    );
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "webhook_delivery.requeue",
+      target,
+      before: truncForAudit(before),
+      after: truncForAudit({ status: after.status, attempts: after.attempts }),
+    });
+    return ok({ dryRun: false, applied: true, target, delivery: after });
   } catch (e) {
     return failOf(e);
   }
@@ -260,7 +332,7 @@ export async function webhookTest(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.webhook_id, "webhook_id");
+  const id = parseMcpId(args.webhook_id, "webhook_id");
   if (typeof id !== "bigint") return id;
   try {
     return ok({ result: await sendWebhookTest(ctx, id, base) });
@@ -334,7 +406,7 @@ export async function alertChannelCreate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.alert_channel_create",
+      action: "alert_channel.create",
       target: `alert_channel:${created.id}`,
       before: null,
       after: truncForAudit({
@@ -380,7 +452,7 @@ export async function alertChannelUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.channel_id, "channel_id");
+  const id = parseMcpId(args.channel_id, "channel_id");
   if (typeof id !== "bigint") return id;
   if (args.url_ref !== undefined) {
     const refCheck = await resolveSecretRef(ctx, args.url_ref, base);
@@ -439,7 +511,7 @@ export async function alertChannelUpdate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.alert_channel_update",
+      action: "alert_channel.update",
       target,
       before: truncForAudit(beforeProj),
       after: truncForAudit({
@@ -462,7 +534,7 @@ export async function alertChannelDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.channel_id, "channel_id");
+  const id = parseMcpId(args.channel_id, "channel_id");
   if (typeof id !== "bigint") return id;
   try {
     const all = await listAlertChannels(ctx, base);
@@ -486,7 +558,7 @@ export async function alertChannelDelete(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.alert_channel_delete",
+      action: "alert_channel.delete",
       target,
       before: truncForAudit(beforeProj),
       after: null,
@@ -533,8 +605,11 @@ export async function integrationCreate(
     if ("fail" in resolved) return resolved.fail;
     inboundSecretRef = resolved.ref;
   }
-  const tenantId = ctx.tenantId as bigint;
   try {
+    // Before the preview, not only before the write: `dry_run` defaults to true, so the preview is
+    // the operator's FIRST answer, and one that approves what the apply refuses is worse than no
+    // preview at all (issue #248).
+    if (args.config) assertUsableHeaderNames(args.config);
     if (args.dry_run !== false) {
       return ok({
         dryRun: true,
@@ -552,7 +627,7 @@ export async function integrationCreate(
       });
     }
     const created = await createIntegrationInstance(
-      tenantId,
+      ctx,
       {
         catalogType: args.catalog_type,
         name: args.name,
@@ -569,7 +644,7 @@ export async function integrationCreate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.integration_create",
+      action: "integration.create",
       target: `integration:${created.id}`,
       before: null,
       after: truncForAudit({
@@ -611,7 +686,7 @@ export async function integrationUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.integration_id, "integration_id");
+  const id = parseMcpId(args.integration_id, "integration_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -662,6 +737,7 @@ export async function integrationUpdate(
       afterProj[k] = patch[k];
     }
     const target = `integration:${id}`;
+    if (patch.config) assertUsableHeaderNames(patch.config);
     if (args.dry_run !== false) {
       return ok({
         dryRun: true,
@@ -676,7 +752,7 @@ export async function integrationUpdate(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.integration_update",
+      action: "integration.update",
       target,
       before: truncForAudit(beforeProj),
       after: truncForAudit(appliedProj),
@@ -700,7 +776,7 @@ export async function integrationDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.integration_id, "integration_id");
+  const id = parseMcpId(args.integration_id, "integration_id");
   if (typeof id !== "bigint") return id;
   try {
     const current = await getIntegrationInstance(ctx, id, base);
@@ -722,7 +798,7 @@ export async function integrationDelete(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.integration_delete",
+      action: "integration.delete",
       target,
       before: truncForAudit(beforeProj),
       after: null,

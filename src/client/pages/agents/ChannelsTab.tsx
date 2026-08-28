@@ -17,6 +17,7 @@ import {
 } from "@/client/components";
 import { ServiceLogo } from "@/client/components/icons/ServiceLogo";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 
 type DeploymentData = Awaited<
   ReturnType<typeof api.api.v1.chatwoot.deployment.get>
@@ -36,9 +37,15 @@ type AgentLite = NonNullable<AgentsData>["agents"][number];
 export function ChannelsTab({
   agentId,
   agentName,
+  onBindingChanged,
 }: {
   agentId: string;
   agentName: string;
+  // Binding acts immediately, with no save to piggyback on, and the editor's warning panel asks a
+  // question whose answer is per-BOUND-inbox (whether Chatwoot already replies out of hours there).
+  // Without this the panel would only catch up on the next load, which is the one moment the
+  // operator has already stopped looking for it.
+  onBindingChanged?: () => void;
 }) {
   const { t } = useTranslation();
   const { showToast } = useToast();
@@ -116,9 +123,11 @@ export function ChannelsTab({
         return next;
       });
       showToast(t("channels.bound", "Inbox updated."), "success");
-    } catch {
+      onBindingChanged?.();
+    } catch (e) {
       showToast(
-        t("channels.bindError", "Could not update the inbox."),
+        apiErrorMessage(e) ||
+          t("channels.bindError", "Could not update the inbox."),
         "error",
       );
     } finally {
@@ -160,9 +169,10 @@ export function ChannelsTab({
       if (err) throw err;
       setBotStatus((prev) => ({ ...prev, [inboxId]: "active" }));
       showToast(t("channels.reconnected", "Bot reconnected."), "success");
-    } catch {
+    } catch (e) {
       showToast(
-        t("channels.reconnectError", "Could not reconnect the bot."),
+        apiErrorMessage(e) ||
+          t("channels.reconnectError", "Could not reconnect the bot."),
         "error",
       );
     } finally {

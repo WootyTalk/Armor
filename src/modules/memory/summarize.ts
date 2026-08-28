@@ -9,12 +9,16 @@ import { estimateTokenCount } from "tokenx";
 import logger from "@/api/lib/logger";
 import {
   CONVERSATION_DIVIDER,
+  HUMAN_AGENT_NOTE,
+  isHumanAgentTurn,
   isMemoryHead,
   isNudgeTurn,
 } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
 import { runModelCall } from "@/graph/model-limit";
 import { DATA_FENCE } from "@/graph/nudge";
+import { providerFailure } from "@/lib/provider-failure";
+import { clipText, clipTextEnd } from "@/lib/text";
 
 // Condenses the raw turns of a closed attendance into the memory the agent keeps of it.
 //
@@ -55,17 +59,14 @@ function clipTranscript(
   joined: string,
   maxHistoryTokens: number | null,
 ): string {
-  let text =
-    joined.length > TRANSCRIPT_MAX_CHARS
-      ? joined.slice(joined.length - TRANSCRIPT_MAX_CHARS)
-      : joined;
+  let text = clipTextEnd(joined, TRANSCRIPT_MAX_CHARS);
   if (!maxHistoryTokens || maxHistoryTokens <= 0) return text;
   for (let pass = 0; pass < CLIP_PASSES; pass++) {
     const estimate = estimateTokenCount(text);
     if (estimate <= maxHistoryTokens) break;
     const keep = Math.floor((text.length * maxHistoryTokens) / estimate);
     if (keep <= 0) return "";
-    text = text.slice(text.length - keep);
+    text = clipTextEnd(text, keep);
   }
   return text;
 }
@@ -161,6 +162,21 @@ export function renderTranscript(
     // summary — the trade runs the safe way, unlike leaving operator instructions in.
     if (isNudgeTurn(m) || (type === "human" && text.includes(DATA_FENCE)))
       continue;
+    // A HUMAN AGENT's reply, folded in by continuous ingestion. It rides as a HumanMessage as well
+    // (src/graph/markers.ts), so without this branch it renders as `cliente:` and the attendance is
+    // remembered with the operator's own words attributed to the contact — issue #187, and the one
+    // outcome that issue calls worse than the message being missing altogether.
+    //
+    // The note is trimmed by exact match but the BRANCH is marker-gated, which is the safe way round
+    // here: a customer who types that exact sentence still renders as `cliente:` and keeps every word
+    // of it, because what decides attribution is metadata a chat cannot carry.
+    if (isHumanAgentTurn(m)) {
+      if (text.startsWith(HUMAN_AGENT_NOTE)) {
+        text = text.slice(HUMAN_AGENT_NOTE.length).trim();
+      }
+      if (text) lines.push(`atendente: ${text}`);
+      continue;
+    }
     // System markers ride as HumanMessages (src/graph/markers.ts), and the ingestion path folds the
     // divider into the customer's own turn — so this strips the marker and keeps the words around it,
     // rather than dropping the message. Left in, the system's directive would be quoted back to the
@@ -201,6 +217,12 @@ export function renderTranscript(
   return clipTranscript(joined, maxHistoryTokens);
 }
 
+// The rule this file used to own now lives in `@/lib/provider-failure`, because five other provider
+// boundaries needed the same one and a rule written once per call site is a rule the next call site
+// is born without. What stays here is the reading only this caller has: `runModelCall` has already
+// reduced whatever the provider wrote, but it cannot know that OUR signal is what stopped the wait,
+// so the abort is asserted from the signal rather than inferred from the error.
+
 export async function summarizeAttendance(
   model: BaseChatModel,
   messages: BaseMessage[],
@@ -216,9 +238,22 @@ export async function summarizeAttendance(
   // remember. That is a legitimate empty summary, not a failure, so it must not carry `error`.
   if (!transcript.trim()) return { summary: "" };
 
+  // Ours, and held so that `signal.aborted` can be read afterwards: it is the only reading of "it
+  // timed out" that does not come from the response. Every other tell — the error's name, its
+  // message — is written by someone else.
+  //
+  // Made INSIDE the callback, which is not a detail. `runModelCall` waits on the process-wide model
+  // semaphore BEFORE it calls this, and calls it a SECOND time when the provider returns an empty
+  // completion. A signal created outside would spend its budget queueing behind other turns and hand
+  // the retry whatever was left — so on a fleet busy enough for the wait to approach the ceiling,
+  // every compaction would abort before its call began and dead-letter for a reason that has nothing
+  // to do with the provider. The variable therefore holds the LAST attempt's signal, which is the
+  // one the error came from.
+  let attemptSignal: AbortSignal | undefined;
   try {
-    const res = await runModelCall(() =>
-      model.invoke(
+    const res = await runModelCall(() => {
+      attemptSignal = AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS);
+      return model.invoke(
         [
           new SystemMessage(SYSTEM_PROMPT),
           // NOTE: The transcript is never interpolated into the system prompt. Everything in a
@@ -229,19 +264,19 @@ export async function summarizeAttendance(
           ),
         ],
         {
-          signal: AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS),
+          signal: attemptSignal,
           ...(callbacks ? { callbacks } : {}),
         },
-      ),
-    );
+      );
+    });
     const text = contentToText(res.content).trim();
     if (!text) return { summary: "", error: "empty completion" };
-    return { summary: text.slice(0, ATTENDANCE_SUMMARY_MAX) };
+    return { summary: clipText(text, ATTENDANCE_SUMMARY_MAX) };
   } catch (err) {
     logger.warn({ err }, "memory: attendance summary failed, thread untouched");
     return {
       summary: "",
-      error: err instanceof Error ? err.message : String(err),
+      error: providerFailure(err, attemptSignal?.aborted === true),
     };
   }
 }

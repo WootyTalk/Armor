@@ -1,3 +1,4 @@
+import { clipText } from "@/lib/text";
 // Per-agent follow-up configuration from agent.settings.followUp.
 // Same reader/default/clamp pattern as debounce/stt/tts/split/serviceWindow.
 //
@@ -7,7 +8,6 @@
 // default step (its pre-multi-step config is not read).
 
 import {
-  clipText,
   FOLLOW_UP_INSTRUCTIONS_MAX,
   FOLLOW_UP_MAX_STEPS,
 } from "@/modules/agents/text-caps";
@@ -21,6 +21,18 @@ export interface FollowUpStep {
   // Deterministic, system-applied actions when this step fires (even if the agent stays silent):
   assignLabels?: string[]; // Chatwoot labels to add (merged, never replacing the set)
   resolve?: boolean; // resolve the conversation — honored ONLY on the last step
+  // Let THIS step fire even while the conversation has a live appointment, with
+  // `pauseWhileAppointment` left on for every other step (issue #103).
+  //
+  // The agent-wide flag conflates two opposite things. A re-engagement nudge wants to be suppressed
+  // while a booking stands; a payment-deadline step wants exactly the reverse — it only means
+  // anything WHILE the booking is unconfirmed, and it is the step that later frees the slot. Without
+  // this, an operator who needs both in one sequence has to turn the pause off for the whole agent,
+  // which drops it where it was right.
+  //
+  // Deliberately NOT a notion of "paid" or "confirmed": the platform does not know what those mean
+  // for any given operator, and the step that does is the one they wrote.
+  ignoreAppointmentPause?: boolean;
 }
 
 export interface FollowUpConfig {
@@ -87,7 +99,15 @@ function clampInt(
   return Math.min(Math.max(Math.round(v), min), max);
 }
 
-const VALID_UNITS = new Set<string>(["minutes", "hours", "days"]);
+// Exported for the MCP argument schema (see modules/agents/settings-schema); the Set below is
+// derived from it so the two can never disagree.
+export const FOLLOW_UP_DELAY_UNITS = [
+  "minutes",
+  "hours",
+  "days",
+] as const satisfies readonly FollowUpDelayUnit[];
+
+const VALID_UNITS = new Set<string>(FOLLOW_UP_DELAY_UNITS);
 
 // Normalize one raw step (clamp delay, trim/bound instructions + label). Returns null only for a
 // non-object input; missing numeric/string fields collapse to defaults.
@@ -113,11 +133,12 @@ function readStep(raw: unknown): FollowUpStep | null {
   const labels: string[] = [];
   for (const l of rawLabels) {
     if (typeof l !== "string") continue;
-    const trimmed = l.trim().slice(0, 100);
+    const trimmed = clipText(l.trim(), 100);
     if (trimmed && !labels.includes(trimmed)) labels.push(trimmed);
   }
   if (labels.length > 0) step.assignLabels = labels;
   if (bag.resolve === true) step.resolve = true;
+  if (bag.ignoreAppointmentPause === true) step.ignoreAppointmentPause = true;
   return step;
 }
 
@@ -144,13 +165,12 @@ export function readFollowUpConfig(settings: unknown): FollowUpConfig {
   const lastIdx = steps.length - 1;
   steps = steps.map((s, i) => {
     if (i === lastIdx || !s.resolve) return s;
-    const stripped: FollowUpStep = {
-      delayValue: s.delayValue,
-      delayUnit: s.delayUnit,
-      instructions: s.instructions,
-    };
-    if (s.assignLabels) stripped.assignLabels = s.assignLabels;
-    return stripped;
+    // NOTE: removed with a rest spread, never rebuilt field by field. A rebuild lists what to
+    // keep, so every field added to a step after it was written is dropped here — silently, and
+    // only for a mid-sequence step that happens to carry `resolve`. `ignoreAppointmentPause` would
+    // have been the first.
+    const { resolve: _dropped, ...kept } = s;
+    return kept;
   });
 
   return {

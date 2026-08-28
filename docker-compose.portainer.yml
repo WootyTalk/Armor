@@ -88,6 +88,14 @@ services:
       # find a chain shorter than the count and fall back to the Caddy socket — one bucket again. To
       # key on the real client behind a CDN, give the caddy service `trusted_proxies` for the CDN's
       # ranges first, then raise this to 2.
+      # NOTE: the outgoing runtime role during a DATABASE_URL rotation, declared for the length of
+      # the overlap. Bootstrap reconciles fleet-role membership down to this database's runtime role
+      # and the administrator, so without this the outgoing role loses its cross-tenant path mid-
+      # drain and every asSuperAdmin call in the container still serving on it — API-key
+      # verification included — starts reading zero rows. Not inferred from an open session: a
+      # stale installation whose database was recreated under the same name presents exactly the
+      # same session (measured). Comma-separated; clear it once the old container is gone.
+      - FLEET_ROLE_RETAIN_MEMBER=${FLEET_ROLE_RETAIN_MEMBER:-}
       - TRUST_PROXY=true
       - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
       # NOTE: rate-limit ceilings, per client address. The first two are runaway guards, generous on
@@ -117,9 +125,14 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       # Checkpointer pool — MUST be the runtime (non-superuser) role, never the migration URL.
       - LANGGRAPH_DATABASE_URL=${LANGGRAPH_DATABASE_URL}
-      # Persist uploaded branding + generated quote PDFs on the `storage` volume (defaults live on the
+      # Persist uploaded branding + issued document PDFs on the `storage` volume (defaults live on the
       # ephemeral container FS and vanish on every redeploy).
       - BRANDING_STORAGE_DIR=/app/storage/branding
+      - DOCUMENTS_STORAGE_DIR=/app/storage/documents
+      # NOTE: kept for installations created before the rename. Platforms that FREEZE a compose
+      # value at install time (Coolify) never deliver the new name to an existing install, so
+      # dropping this line would send its PDFs to the container filesystem, where a redeploy
+      # erases them without a word. config.ts reads DOCUMENTS_STORAGE_DIR first, then this.
       - QUOTES_STORAGE_DIR=/app/storage/quotes
     # No host port publish: Caddy is the only ingress and reaches the app over the compose network.
     expose:

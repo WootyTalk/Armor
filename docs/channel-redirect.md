@@ -49,6 +49,30 @@ conversation link). The gate is called from
   `hmac_verified` flag is what makes Chatwoot resume the contact's conversation across sessions/devices
   (`Api::V1::Widget::BaseController#conversations` → `conversations.last`), so re-entry never forks a new
   conversation.
+- **The identifier is settled per contact, and then kept.** Before minting, the gate reads what the
+  WhatsApp contact carries. If it is already `fzwa:<X>` (or a moved value, below) it is kept as is and
+  nothing is written: a live token was minted for it, and links outlive the resend cooldown by design
+  (24h), so re-deriving a value on each delivery would detach the one issued minutes ago.
+- **A held identifier is answered by taking a different one.** `identifier` is unique per Chatwoot
+  account, so if any other contact holds `fzwa:<X>` the stamp is refused with
+  `422 Identifier has already been taken`, and with a fixed value every later redirect for that lead
+  fails the same way, permanently and in silence. The gate stamps `fzwa:<X>:<8 random hex>` instead and
+  mints the token for **that** value. The old one is abandoned where it sits: whoever holds it keeps
+  it, inert, because this side never asks for it again.
+  - A contact that moved keeps its value **even if the base later becomes free**, for the same reason
+    it is kept at all: a token is out there carrying it.
+  - Unification still happens through the normal path: the widget identifies with whatever the token
+    carries, and Chatwoot merges that contact onto whoever holds it, which is the WhatsApp contact.
+  - Squatting stops working, because an identifier that does not exist until it is minted cannot be
+    claimed in advance.
+  - The read-then-write is serialized per contact (process-local), so two deliveries arriving together
+    cannot mint two different suffixes and leave one of the links pointing at a value the contact no
+    longer holds.
+  - Nothing about the other contact is read, trusted or written. That is deliberate: this API has no
+    way to answer "who holds exactly this identifier" (`/contacts/search` matches a substring across
+    four fields, 15 rows a page; `/contacts/filter` is exact but case-insensitive, paged the same way,
+    and its base narrows to `contact_type: 'lead'` once `crm_v2` is on) and no conditional write, so
+    any repair aimed at the holder rests on an answer that can be wrong or stale.
 
 ### Cross-conversation link (on merge)
 
@@ -137,3 +161,15 @@ The widget patch and the two endpoints live in the fazer.ai Chatwoot fork (not t
   through (`misconfigured` → the lead is served on WhatsApp as a fallback rather than dead-ended).
 - The `Inbox.webWidget` column and `writeWebWidgetBlob` are legacy from the removed provisioning path and
   are no longer read; `website_url` now comes back from the mint call.
+
+## Where the orphan contact comes from, and why identity cannot come from the identifier
+
+`ContactIdentifyAction` (upstream) decides by identifier: it **merges** the visitor into the contact holding the value, and **assigns** the value to the visitor when nobody holds it. That second half is what creates the `fzwa:` orphan — the value is derived from a sequential id and belongs to ONE contact, so handing it to a browser session leaves the lead with two contacts, and the second one squats the identifier every later redirect needs. PR #272 recorded that it could not reproduce how the identifier ended up on the other contact; this is that branch. Reproduced by RSpec and then live (A/B against a real Chatwoot): without the fix, 2 contacts with the visitor holding the lead's `fzwa:`; with it, 1.
+
+**The proof of identity comes from the mint, never from the identifier.** `POST /api/v1/accounts/:id/redirect_tokens` is authenticated per account: the caller names `contact_id`, the token payload stores `identified_contact_id`, and resolve merges into that contact. The token is single-use, server-side, and the widget never reads it.
+
+Three traps that apply to any future change to that endpoint:
+
+1. **`contact_id` is optional on purpose.** Without it the endpoint keeps the old contract — a pre-authenticated deep link that CREATES a new identity (a CRM handing over `crm-user-42`, say). Making the rule mandatory breaks that use.
+2. **"This browser is already somebody" is THREE fields**, the same ones `ContactIdentifyAction` merges on: `identifier`, `email`, `phone_number`. Asking only about the identifier reads a pre-chat contact as anonymous, and anonymous is the only kind that branch can consume — the customer becomes the mergee and is destroyed.
+3. **A refused write dirties the in-memory object.** A non-bang `update` that fails on uniqueness leaves the attempted value on the attribute, and `Message.create!(sender: @contact)` re-runs the validation and answers **422**, so the lead never enters the chat. `restore_attributes` closes it.

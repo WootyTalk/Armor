@@ -5,6 +5,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { failableTool, toolFailure } from "@/graph/tools/failure";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { clipText } from "@/lib/text";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
 import type {
   ChatwootClient,
@@ -15,6 +16,11 @@ import {
   attributesForModel,
   type ChatwootVocab,
 } from "@/modules/chatwoot/vocab";
+import {
+  type ObservedConversation,
+  observeBeforeClose,
+  recordResolutionOrigin,
+} from "@/modules/conversations/record-resolution";
 import type { HandoffConfig } from "@/modules/handoff/settings";
 import {
   type HandoffTargets,
@@ -64,55 +70,90 @@ function sysCtx(tenantId: bigint): TenantContext {
 // takeover and discard the reply — and the reply would reopen the conversation anyway).
 export interface TurnState {
   resolveRequested: boolean;
-  // Images the agent asked to send this turn, fetched and validated but NOT yet delivered. They ride
+  // Files the agent asked to send this turn, loaded and validated but NOT yet delivered. They ride
   // the same post-time pipeline as the reply (ownership recheck, supersede gate, output guardrail),
   // because a tool that posts from inside the graph invocation can message a customer whose turn is
   // then discarded — the same reason resolve_conversation is deferred.
-  pendingImages: PendingImage[];
+  //
+  // ONE queue for every tool that attaches something (send_image, a document tool): the gates a file
+  // has to pass to reach a customer are a property of the TURN, not of what the file is, and a second
+  // queue would be a second place to remember them.
+  pendingAttachments: PendingAttachment[];
   // Downloads accepted but not yet queued. LangGraph's ToolNode runs one response's tool calls with
   // Promise.all, so a batch of send_image calls all reach the ceiling check before any of them has
   // queued anything: without a reservation taken BEFORE the await, every call in the batch reads the
   // same empty queue, passes, and the ceiling means nothing.
   imagesInFlight: number;
+  // Documents issued but not yet queued. Same reservation as imagesInFlight and for the same reason,
+  // with a ceiling of one: without it a batch of document calls all read an empty queue, all issue a
+  // numbered document, and all but one of those rows is discarded unsent.
+  documentsInFlight: number;
   // Monotonic ticket, taken before the download for the same reason: the batch runs concurrently, so
   // the queue fills in COMPLETION order and the customer would receive the pictures — and the
   // captions written for them — in whatever order the hosts happened to answer. The order the model
   // asked for is the one that matches the words around them.
-  imagesSeq: number;
+  attachmentsSeq: number;
 }
 
 // Isolated from TurnState on purpose: reactive turns and proactive nudges share handoff delivery,
 // while resolve/image post-actions have different semantics on those two paths.
 export interface HandoffTurnState {
-  // The closing line reached the customer (best-effort send, so it can be false on a live handoff).
-  customerMessageSent: boolean;
+  // The closing line the model wants the customer to read before the transfer. RECORDED here, never
+  // sent from the tool: the runtime is the single writer of customer-facing text, so this line goes
+  // out through the same output guardrail, the same modality choice and the same pacing as any other
+  // reply (issue #160). Null when the model supplied none.
+  customerMessage: string | null;
   // The conversation left `pending`, so the human queue owns it and the bot is done talking.
   completed: boolean;
 }
 
-// Whether the handoff already said everything this turn had to say, which is the ONE question both
-// runtimes ask. Two bits and not one, because the tool's first step is not the caller's question:
-// only a handoff that both gave the customer a closing line AND completed makes the model's final
-// text a second copy of something already read.
+// Whether the handoff supplies this turn's customer-facing text, which is the ONE question both
+// runtimes ask. Two conditions and not one, because a transfer with nothing to say leaves the
+// model's own final text as the only thing the customer would get, and that text is still theirs.
 //
 // A transfer that threw halfway answers false, and has to. sendPrivateNote and toggleStatus are not
-// best-effort, so either can throw after the customer was already told a human is coming; the
+// best-effort, so either can throw AFTER the model composed a line promising a human; the
 // conversation then stays `pending`, i.e. still the bot's and queued to nobody, and the model gets
-// the tool error plus one more step. That recovery reply is the only thing standing between the
-// customer and a promise nobody is going to keep.
+// the tool error plus one more step. That recovery reply is what the customer reads instead, and
+// the undelivered promise is discarded with the turn that failed to keep it.
+// A TYPE guard and not a boolean, so the line it proves is there is typed as being there. Both
+// callers read `customerMessage` immediately after asking, and both used to cast it to `string` on
+// their own word: a cast is what a compiler accepts INSTEAD of a proof, so the guard could have been
+// deleted at either call site and nothing would have complained until a turn with no transfer
+// handed a null to the guardrail.
 export function handoffAnsweredTheTurn(
   state: HandoffTurnState | undefined,
-): boolean {
-  return !!state && state.customerMessageSent && state.completed;
+): state is HandoffTurnState & { customerMessage: string } {
+  return !!state && !!state.customerMessage && state.completed;
 }
 
-export interface PendingImage {
+export interface PendingAttachment {
   bytes: ArrayBuffer;
   mime: string;
   fileName: string;
   caption?: string;
   // Position in the model's tool-call order, not in download-completion order.
   order: number;
+  // Which tool queued it. Read by the delivery loop for the flow line and for the failure message:
+  // an operator reading "send_image failed" about a document goes to check the image host allowlist
+  // to debug a PDF we read off our own disk.
+  tool: string;
+  // Which quota it counts against. A SECOND field rather than a read of `tool`, because the two
+  // answer different questions: `tool` says which tool produced this line in the trail, and a
+  // tenant-named document tool makes "everything that is not send_image" the wrong way to ask the
+  // other one. Reading one bit for two questions is how the next attachment source lands in the
+  // image budget without anyone noticing.
+  kind: "image" | "document";
+  // Text the MODEL wrote that is inside the file itself, joined into the output guardrail alongside
+  // the captions. A caption rides along because it is model-written text the customer reads; the
+  // values a model put into a document's fields and line-item descriptions are exactly that too, and
+  // they reach the customer on paper. Operator-authored block text is NOT here: screening a
+  // template the operator wrote is moderating the operator, not the model.
+  screenText?: string;
+  // The issued document this file IS, when it is one. Carried so delivery can ask the row whether it
+  // is still deliverable: an operator can revoke between the tool queueing the bytes and the runtime
+  // sending them, and bytes alone cannot answer that.
+  documentId?: bigint;
 }
 
 export interface ToolCtx {
@@ -142,6 +183,11 @@ export interface ToolCtx {
   // step right after set_custom_attribute writes to Chatwoot (see mirrorAttributeWrite). Absent ⇒
   // the write-through is skipped and the mirror catches up on the next webhook event.
   conversationDbId?: bigint | null;
+  // The conversation as the turn observed it, for the immediate resolve_conversation path. Absent
+  // ⇒ the close is not recorded rather than claimed: see record-resolution.ts rule 2. This is the
+  // FALLBACK only: the tool re-reads the live state before closing, because on a nudge turn this
+  // snapshot was taken before a model call that can run for a minute.
+  observed?: ObservedConversation;
   // The contact's CURRENT stored voice preference (snapshot at turn prep), surfaced in the
   // set_voice_preference description so the model knows the existing value before changing it.
   // true = audio, false = text, null/undefined = not set yet.
@@ -250,28 +296,6 @@ function handoffTool(ctx: ToolCtx) {
       assignTo?: string;
       customerMessage?: string;
     }) => {
-      // Reply to the CUSTOMER first (the persona's closing line) so they are not left in silence once
-      // the bot goes quiet after the handoff. Best-effort — a send failure must not block the transfer.
-      if (customerMessage?.trim()) {
-        try {
-          await ctx.client.sendMessage(
-            ctx.conversationId,
-            customerMessage.trim(),
-          );
-          if (ctx.handoffState) ctx.handoffState.customerMessageSent = true;
-        } catch (e) {
-          logger.warn(
-            "handoff customer message failed (conv=%s): %s",
-            String(ctx.conversationId),
-            e instanceof Error ? e.message : String(e),
-          );
-          ctx.onSideEffectError?.({
-            tool: "handoff_to_human",
-            phase: "customer_message",
-            err: e,
-          });
-        }
-      }
       // Transfer-with-summary: a private note for the human BEFORE handing off, gated by the
       // per-agent toggle (default on).
       if (reason && ctx.transferWithSummary !== false) {
@@ -283,7 +307,23 @@ function handoffTool(ctx: ToolCtx) {
       // Only here: everything above can throw, and a handoff that did not reach this line has not
       // happened. The optional assignment below is best-effort by design — the conversation is
       // already out of `pending`, so a routing miss does not put it back.
-      if (ctx.handoffState) ctx.handoffState.completed = true;
+      //
+      // The closing line is recorded HERE, from THIS invocation's argument, and never above: the
+      // caller delivers it, and it must belong to the transfer that actually happened. A model whose
+      // first attempt threw is handed the error and calls the tool again, and a second attempt that
+      // succeeds with no line of its own would otherwise deliver the first one's promise and
+      // suppress the recovery text the model wrote instead.
+      //
+      // Recorded rather than sent from here: sending it from inside the tool is what put the most
+      // rule-bound message of the turn outside the output guardrail, outside TTS and outside the
+      // pacing every other reply gets (#160). The cost is ordering — the customer reads it just
+      // after the transfer instead of just before, which Chatwoot never shows them.
+      if (ctx.handoffState) {
+        if (customerMessage?.trim()) {
+          ctx.handoffState.customerMessage = customerMessage.trim();
+        }
+        ctx.handoffState.completed = true;
+      }
 
       // Optional targeting (best-effort: the handoff already happened, so an assignment failure must
       // not break the turn). In `route` mode nothing is assigned (Chatwoot routes).
@@ -728,7 +768,32 @@ function resolveConversationTool(ctx: ToolCtx) {
         ts.resolveRequested = true;
         return "Resolve scheduled: the conversation will be marked resolved after your final reply in this turn is delivered.";
       }
+      // The row id and tenant are absent on hand-built contexts (and the playground never reaches a
+      // real Chatwoot), so an unrecordable close is left unattributed rather than guessed at.
+      const recordable = ctx.tenantId != null && ctx.conversationDbId != null;
+      // BEFORE the toggle, and freshly. This branch runs inside a nudge's model call, which can take
+      // a minute, so `ctx.observed` was taken before generation: an operator, an automation rule or
+      // `auto_resolve_after` closing meanwhile makes our toggle a silent no-op in Chatwoot, and the
+      // stale "open" would credit the agent for their close. After the toggle it is too late — the
+      // conversation reads "resolved" either way and the two are indistinguishable.
+      const observed = recordable
+        ? await observeBeforeClose(
+            ctx.client,
+            ctx.conversationId,
+            ctx.observed ?? { status: "resolved", statusAt: null },
+          )
+        : { status: "resolved", statusAt: null };
       await ctx.client.toggleStatus(ctx.conversationId, "resolved");
+      // NOTE: Same origin as the deferred path in runtime.ts: the agent judged the request handled.
+      if (recordable) {
+        await recordResolutionOrigin({
+          tenantId: ctx.tenantId as bigint,
+          conversation: { id: ctx.conversationDbId as bigint },
+          origin: "agent",
+          observed,
+          base: ctx.base,
+        });
+      }
       return "Conversation resolved.";
     },
     {
@@ -742,7 +807,7 @@ function resolveConversationTool(ctx: ToolCtx) {
 }
 
 function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  return s.length > max ? `${clipText(s, max - 1)}…` : s;
 }
 
 // THIS card's funnel position as an XML block for kanban_move_card: the current step plus the
@@ -1059,6 +1124,11 @@ function skipReplyTool(_ctx: ToolCtx) {
 // in the agent's config, never in a tool argument: a prompt injection can write any URL it likes and
 // still not reach a host the operator did not list. See modules/images/fetch for the rest of the
 // fence (SSRF assertion, no redirects, byte cap on the body, type read from the file's signature).
+// The image half of the shared attachment queue, which is what both send_image ceilings are about.
+export function queuedImages(turnState: TurnState): PendingAttachment[] {
+  return turnState.pendingAttachments.filter((a) => a.kind === "image");
+}
+
 // The model-facing refusal when a turn has already taken all the images it may carry. Same wording
 // for the count and the byte budget: from the model's side both mean "not this turn".
 function limitReached(): string {
@@ -1097,14 +1167,18 @@ function sendImageTool(ctx: ToolCtx) {
       // BEFORE the await, because the batch runs concurrently — a check that spans the download
       // would be read by every call while the queue is still empty. Bytes are enforced at the other
       // end, where the real size is known; the count keeps the in-flight total bounded meanwhile.
+      // NOTE: counts IMAGES, not the queue. The queue also carries documents, which are our own
+      // rendered files bounded by their own rule — one per turn. Letting one eat an image slot would
+      // make a ceiling the operator reads as "images per message" mean something else depending on
+      // whether a document went out with them.
       const tooManyQueued =
-        turnState.pendingImages.length + turnState.imagesInFlight >=
+        queuedImages(turnState).length + turnState.imagesInFlight >=
         SEND_IMAGE_MAX_PER_TURN;
       if (tooManyQueued) {
         return limitReached();
       }
       turnState.imagesInFlight++;
-      const order = turnState.imagesSeq++;
+      const order = turnState.attachmentsSeq++;
       try {
         const res = await fetchImageForDelivery(url, cfg, {
           fetchImpl: ctx.fetchImpl,
@@ -1123,19 +1197,21 @@ function sendImageTool(ctx: ToolCtx) {
         // while this one downloaded, and a budget that excludes the candidate lets the last accepted
         // image carry the total past the ceiling. No await between the read and the push, so the
         // pair is atomic.
-        const queuedBytes = turnState.pendingImages.reduce(
+        const queuedBytes = queuedImages(turnState).reduce(
           (n, i) => n + i.bytes.byteLength,
           0,
         );
         if (queuedBytes + res.bytes.byteLength > SEND_IMAGE_MAX_TURN_BYTES) {
           return limitReached();
         }
-        turnState.pendingImages.push({
+        turnState.pendingAttachments.push({
           bytes: res.bytes,
           mime: res.mime,
           fileName: res.fileName,
           caption: caption?.trim() || undefined,
           order,
+          tool: "send_image",
+          kind: "image",
         });
         // NOTE: No file name here. This string is the tool's OUTPUT, and `ToolFlowLogger` stores tool
         // outputs verbatim in `ExecutionLog.detail` — a name derived from the URL path would put back

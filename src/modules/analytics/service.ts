@@ -1,7 +1,9 @@
 import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
-import type { UsageSource } from "@/graph/usage";
+import { NON_AGENT_TURN_NODES, type UsageSource } from "@/graph/usage";
+import { badQueryParam } from "@/lib/query-param";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { classifyOutcome } from "@/modules/conversations/resolution-origin";
 
 // Instance metrics for the operational dashboard. LLM tokens/calls are aggregated FROM THE LOCAL
 // LlmUsage table (captured at the source in the model callback), never mirrored from Langfuse —
@@ -73,14 +75,20 @@ export interface MetricsFilter {
 }
 
 // Validate an IANA timezone before interpolating it into `AT TIME ZONE` (an unknown zone makes
-// Postgres throw). Unknown/missing → "UTC". `Intl.DateTimeFormat` throws RangeError for bad zones.
+// Postgres throw). `Intl.DateTimeFormat` throws RangeError for bad zones.
+//
+// A zone the caller SENT and this cannot read is refused, not replaced (issue #372). The fallback
+// this replaces is the worst shape of the family: `tz=America/Sao_Paolo` (one typo) silently
+// bucketed the dashboard in UTC, so a 21h local turn showed up on tomorrow — the exact bug the
+// zone parameter exists to prevent, with numbers that look right. ABSENT still means UTC, because
+// absent is not a value; `""` is one, and it is what a cleared select submits.
 export function normalizeTimeZone(tz: string | undefined): string {
-  if (!tz) return "UTC";
+  if (tz === undefined) return "UTC";
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: tz });
     return tz;
   } catch {
-    return "UTC";
+    badQueryParam("tz");
   }
 }
 
@@ -215,18 +223,45 @@ export async function getInstanceMetrics(
 }
 
 // Operational KPIs (the AI-support-agent standard: Intercom Fin / OpenAI). "Involved" = the bot
-// actually ran on the conversation (it produced LlmUsage). Resolution = of those, how many were
-// resolved without a human taking over (assigneeType != User). Automation = Involvement ×
-// Resolution = resolved-by-bot / total. All computed from local data (LlmUsage + the Conversation
-// mirror), RLS-scoped inside the tx.
+// actually ran on the conversation (it produced LlmUsage). Resolution = of those, how many the AGENT
+// itself closed. Automation = Involvement × Resolution = resolved-by-bot / total. All computed from
+// local data (LlmUsage + the Conversation mirror), RLS-scoped inside the tx.
+//
+// Resolution used to read `status === "resolved" && assigneeType !== "User"`, which counted six
+// closings that are not the agent's — including a follow-up ladder closing out a lead that never
+// answered, and Chatwoot's own `auto_resolve_after`. Both make the number RISE as engagement gets
+// worse. It now reads `Conversation.resolvedBy`, recorded where we close a conversation; the whole
+// argument is in src/modules/conversations/resolution-origin.ts.
 export interface DashboardKpis {
   totalConversations: number;
   involved: number;
   resolvedByBot: number;
   handoff: number;
+  // Involved conversations already resolved when this instance started recording the origin. They
+  // cannot be attributed either way, so they are reported instead of counted, and the dashboard says
+  // so — otherwise the funnel steps down on upgrade day and reads as the agent getting worse.
+  resolvedBeforeTracking: number;
   involvementRate: number;
   resolutionRate: number;
   automationRate: number;
+  // MEDIAN seconds from the conversation's creation to the team's first reply — Chatwoot's own
+  // first-response SLA, mirrored (`chatwootCreatedAt` / `chatwootFirstReplyAt`) rather than
+  // recomputed, so this reports the same number the operator reads on the Chatwoot dashboard.
+  // Median and not mean: one conversation opened on a Friday night and answered on Monday moves a
+  // mean by hours and says nothing about the week.
+  //
+  // This is the only KPI here that does not go through LlmUsage, and it is the only one that still
+  // answers on an inbox the agent never touched. NULL when no conversation in the window carries
+  // both readings — a conversation nobody has answered yet has no response time, and one no event
+  // has been seen for since the columns existed has not been mirrored yet. Hence the sample count
+  // beside it: a median over four conversations is not a service level, and the caller has to be
+  // able to tell that apart from a median over four hundred.
+  //
+  // A conversation the BUSINESS opened counts its own opening message as the reply, because that is
+  // what `first_reply_created_at` means to Chatwoot. Timing the customer's wait instead is a
+  // different metric (Chatwoot answers it with `waiting_since`) and a different decision.
+  firstResponseSeconds: number | null;
+  firstResponseSampled: number;
 }
 
 export async function getKpis(
@@ -244,6 +279,14 @@ export async function getKpis(
         // mirror conversation (conversationId stays null), and source="inbox" makes that explicit.
         conversationId: { not: null },
         source: "inbox",
+        // A billed call is not the same claim as "the agent took this conversation", and this is
+        // the only reader that makes the second one. Vision runs on the incoming attachment before
+        // the bot-ownership gate decides anything, so an image sent into a conversation a human
+        // handled start to finish would otherwise land here as bot involvement.
+        //   The null arm is not a formality: Prisma renders `notIn` as plain SQL `NOT IN`, which
+        // drops NULL rows rather than keeping them (measured), and a legacy row with no node is an
+        // agent turn. Without it this filter would quietly shrink every historical figure.
+        OR: [{ node: null }, { node: { notIn: [...NON_AGENT_TURN_NODES] } }],
         ...(filter.since ? { createdAt: { gte: filter.since } } : {}),
       },
       select: { conversationId: true },
@@ -255,21 +298,60 @@ export async function getKpis(
     const involved = involvedIds.length;
     let resolvedByBot = 0;
     let handoff = 0;
+    let resolvedBeforeTracking = 0;
     if (involved > 0) {
       const convs = await db.conversation.findMany({
         where: { id: { in: involvedIds } },
-        select: { status: true, assigneeType: true },
+        select: { status: true, assigneeType: true, resolvedBy: true },
       });
       for (const c of convs) {
-        if (c.assigneeType === "User") handoff += 1;
-        else if (c.status === "resolved") resolvedByBot += 1;
+        switch (classifyOutcome(c)) {
+          case "handoff":
+            handoff += 1;
+            break;
+          case "resolved_by_agent":
+            resolvedByBot += 1;
+            break;
+          case "resolved_before_tracking":
+            resolvedBeforeTracking += 1;
+            break;
+          // NOTE: resolved_by_other / unresolved: neither a resolution nor a handoff.
+        }
       }
     }
+    // Raw SQL for percentile_cont (no Prisma builder), inside the scoped tx so RLS fences the rows —
+    // never filter tenant_id by hand. EPOCH of the difference: both columns are mirrored from the
+    // same Chatwoot row, so the subtraction is between two readings of one source rather than
+    // across two clocks.
+    const [responseRow] = await db.$queryRaw<
+      { median: number | null; sampled: number }[]
+    >(Prisma.sql`
+      SELECT percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY EXTRACT(EPOCH FROM (chatwoot_first_reply_at - chatwoot_created_at))
+             )::float8 AS median,
+             COUNT(*)::int AS sampled
+        FROM conversations
+       WHERE chatwoot_created_at IS NOT NULL
+         AND chatwoot_first_reply_at IS NOT NULL
+         -- A reply cannot precede the conversation that carries it: a clock skew or a hand-written
+         -- row would otherwise contribute a negative "response time".
+         AND chatwoot_first_reply_at >= chatwoot_created_at
+         -- The window is the one the other KPIs use — OUR row's createdAt — so a filtered dashboard
+         -- counts the same conversations here as it does above.
+         AND (${filter.since ?? null}::timestamptz IS NULL OR created_at >= ${filter.since ?? null})`);
+    // COUNT and the percentile come from ONE aggregate over the same rows, so they cannot
+    // disagree: no row in the sample means `sampled` is 0 and `median` is NULL together.
+    const sampled = Number(responseRow?.sampled ?? 0);
+
     return {
       totalConversations,
       involved,
       resolvedByBot,
       handoff,
+      resolvedBeforeTracking,
+      firstResponseSeconds:
+        responseRow?.median != null ? Number(responseRow.median) : null,
+      firstResponseSampled: sampled,
       involvementRate:
         totalConversations > 0 ? involved / totalConversations : 0,
       resolutionRate: involved > 0 ? resolvedByBot / involved : 0,

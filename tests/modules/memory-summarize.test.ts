@@ -11,6 +11,8 @@ import { estimateTokenCount } from "tokenx";
 import {
   CONVERSATION_DIVIDER,
   conversationDividerMessage,
+  HUMAN_AGENT_NOTE,
+  humanAgentMessage,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
   nudgeMessage,
@@ -128,6 +130,42 @@ describe("renderTranscript", () => {
     expect(t).toContain("Passando para lembrar do orçamento");
   });
 
+  // Issue #187. A human agent's reply rides as a HumanMessage (a system role never survives to the
+  // model), so without the marker branch this whole line renders as `cliente:` — and the attendance
+  // is remembered as a customer who quoted a price to themselves.
+  test("a human agent's reply is the attendant, not the customer", () => {
+    const t = renderTranscript([
+      new HumanMessage("quanto fica o plano anual?"),
+      humanAgentMessage(42, "Fecho o anual por R$ 1.200."),
+      new HumanMessage("fechado"),
+    ]);
+    expect(t).toBe(
+      [
+        "cliente: quanto fica o plano anual?",
+        "atendente: Fecho o anual por R$ 1.200.",
+        "cliente: fechado",
+      ].join("\n"),
+    );
+    // The note is scaffolding for the live model, not something the summarizer should remember.
+    expect(t).not.toContain(HUMAN_AGENT_NOTE);
+  });
+
+  // What decides attribution is metadata a chat cannot carry. This repo is public, so "a customer
+  // could type that sentence" includes "chose to" — and the cost of keying on the text would be a
+  // customer able to have their own words filed under the team's.
+  test("a customer typing the note verbatim is still the customer, with every word", () => {
+    const t = renderTranscript([
+      new HumanMessage(`${HUMAN_AGENT_NOTE}\n\ncombinamos R$ 50, certo?`),
+    ]);
+    expect(t).toBe(`cliente: ${HUMAN_AGENT_NOTE}\n\ncombinamos R$ 50, certo?`);
+  });
+
+  // An attendant who sends only an attachment leaves an empty body. Rendering `atendente: ` would
+  // spend a line of the summarizer's window saying nothing happened.
+  test("an attendant message with no words renders nothing", () => {
+    expect(renderTranscript([humanAgentMessage(42, "")])).toBe("");
+  });
+
   // The bare divider is what a new attendance holds when an input guardrail answered before the model
   // ran. Rendering it would bill a generation to summarize the system's own directive as history.
   test("an attendance holding only the bare divider renders nothing", () => {
@@ -235,7 +273,67 @@ describe("summarizeAttendance", () => {
     expect(res.error).toBeTruthy();
   });
 
+  // The 60s ceiling belongs to the CALL, not to the wait in front of it. `runModelCall` takes a
+  // permit from the process-wide model semaphore before it invokes this, and invokes it a SECOND
+  // time when the provider returns an empty completion — so a signal made once, outside, would spend
+  // its budget queueing behind other turns and then hand the retry the remainder. On a fleet busy
+  // enough for the wait to approach the ceiling, every compaction would abort before its call began
+  // and dead-letter for a reason that has nothing to do with the provider.
+  //
+  // Two distinct, unaborted signals is the observable form of that: one made outside would be the
+  // same object twice.
+  test("each attempt gets its own timeout, started when the call is", async () => {
+    const seen: Array<AbortSignal | undefined> = [];
+    class TwoAttempts extends BaseChatModel {
+      calls = 0;
+      constructor() {
+        super({});
+      }
+      _llmType() {
+        return "fake-two-attempts";
+      }
+      async _generate(
+        _messages: BaseMessage[],
+        options?: { signal?: AbortSignal },
+      ): Promise<ChatResult> {
+        seen.push(options?.signal);
+        this.calls += 1;
+        // The one fault runModelCall retries rather than failing on.
+        if (this.calls === 1) throw new TypeError("no generations returned");
+        return {
+          generations: [{ text: "resumo", message: new AIMessage("resumo") }],
+        };
+      }
+    }
+    const res = await summarizeAttendance(new TwoAttempts(), [
+      new HumanMessage("oi"),
+    ]);
+    expect(res.error).toBeUndefined();
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBeDefined();
+    expect(seen[0]).not.toBe(seen[1]);
+    expect(seen[0]?.aborted).toBe(false);
+    expect(seen[1]?.aborted).toBe(false);
+  });
+
+  // The WIRING of the line above, which no cheap test can drive: making the real timeout fire costs
+  // sixty seconds, and shortening it means a parameter that exists only for the test. So this half is
+  // asserted over the source — and it is worth asserting, because without the argument the summariser
+  // still fails safely and merely reports "provider error" for a timeout, which nothing would notice.
+  // Where the signal is CREATED is not asserted here; that has an observable form, in
+  // tests/modules/memory-summarize.test.ts.
+  test("the summariser decides a timeout from its own signal, not from the error", async () => {
+    const src = await Bun.file("src/modules/memory/summarize.ts").text();
+    expect(src).toContain(
+      "providerFailure(err, attemptSignal?.aborted === true)",
+    );
+  });
+
   test("a provider failure is reported, and never throws into the job", async () => {
+    // The status comes from the client's NUMBER field, never from the text. A bare rethrow whose
+    // message happens to read "429" reports `provider error`: when there is an HTTP response the
+    // client sets the field, and when there is none a 4xx-shaped number in the text is the
+    // customer's, not the transport's.
     const res = await summarizeAttendance(
       new ScriptedModel(() => {
         throw new Error("429 rate limited");
@@ -243,7 +341,15 @@ describe("summarizeAttendance", () => {
       [new HumanMessage("oi")],
     );
     expect(res.summary).toBe("");
-    expect(res.error).toContain("429");
+    expect(res.error).toBe("provider error");
+
+    const withField = await summarizeAttendance(
+      new ScriptedModel(() => {
+        throw Object.assign(new Error("slow down"), { status: 429 });
+      }),
+      [new HumanMessage("oi")],
+    );
+    expect(withField.error).toBe("HTTP 429");
   });
 });
 

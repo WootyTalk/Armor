@@ -6,11 +6,16 @@ import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { chatwootThreadId, contactInboxThreadId } from "@/graph/checkpointer";
+import type { ResolvedModelConfig } from "@/graph/models";
 import {
   clearMediaAnnotations,
   stashMediaAnnotation,
 } from "@/modules/chatwoot/annotations";
-import type { ChatwootClient } from "@/modules/chatwoot/client";
+import {
+  type ChatwootClient,
+  ChatwootMissingTokenError,
+} from "@/modules/chatwoot/client";
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import {
   armDebounce,
@@ -18,16 +23,28 @@ import {
   resolveDebounceConfig,
 } from "@/modules/debounce/service";
 import { advanceHandledWatermark } from "@/modules/debounce/watermark";
+import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import {
   claimDueDebounceJobs,
   claimDueJobs,
   enqueueJob,
+  retireJobsByDedupeKey,
 } from "@/modules/scheduler/service";
+import {
+  clearFlowLog,
+  flowLogCount,
+  flowLogRow,
+  flowLogRows,
+} from "@/tests/utils/flowlog";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
+  guardrailModel,
+  PromptCapturingModel,
   ResolveThenReplyModel,
+  SendImageThenReplyModel,
+  SideEffectModel,
 } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -54,6 +71,7 @@ const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
 
 let tenantId = 0n;
+let agentDbId = 0n;
 let instanceId = 0n;
 let inboxDbId = 0n;
 
@@ -84,6 +102,9 @@ function makeStub(opts: {
       opts.sent.push([conversationId, content]);
       return {};
     },
+    // A split reply toggles the typing indicator around each balloon; without it here the stub is a
+    // Chatwoot that cannot be told the agent is typing, and the call throws before its own catch.
+    toggleTyping: async () => ({}),
   } as unknown as ChatwootClient;
   return async () => client;
 }
@@ -94,27 +115,53 @@ function makeResolveStub(opts: {
   sent: Array<[number, string]>;
   calls: { getMessages: number };
   toggles: Array<[number, string]>;
+  notes?: Array<[number, string]>;
+  // Every write in the order it left, for the callers that assert a SEQUENCE. Three arrays cannot
+  // say which came first, and the order is the part of the spend-ceiling contract that a fence
+  // makes load-bearing.
+  order?: string[];
 }) {
   let i = 0;
-  const client = {
-    getMessages: async () => {
-      const page = opts.pages[Math.min(i, opts.pages.length - 1)] ?? {
-        payload: [],
-      };
-      i += 1;
-      opts.calls.getMessages += 1;
-      return page;
-    },
-    sendMessage: async (conversationId: number, content: string) => {
-      opts.sent.push([conversationId, content]);
-      return {};
-    },
-    toggleStatus: async (conversationId: number, status: string) => {
-      opts.toggles.push([conversationId, status]);
-      return {};
-    },
-  } as unknown as ChatwootClient;
-  return async () => client;
+  // Built from the CONFIG it is handed, so the token profile is part of what this stub personifies.
+  // `toggle_status` is a bot-token endpoint (docs/chatwoot.md), and the real client refuses an empty
+  // one before anything leaves the process (issue #79) instead of reporting Chatwoot's 401 for a
+  // credential nobody sent. A stub that ignored the config would let a caller that forgot the
+  // persona token record a handoff that never happened.
+  return async (cfg: { botToken?: string }) =>
+    ({
+      getMessages: async () => {
+        const page = opts.pages[Math.min(i, opts.pages.length - 1)] ?? {
+          payload: [],
+        };
+        i += 1;
+        opts.calls.getMessages += 1;
+        return page;
+      },
+      sendMessage: async (conversationId: number, content: string) => {
+        if (!cfg.botToken) {
+          throw new ChatwootMissingTokenError("conversations/messages");
+        }
+        opts.sent.push([conversationId, content]);
+        opts.order?.push("message");
+        return {};
+      },
+      sendPrivateNote: async (conversationId: number, content: string) => {
+        if (!cfg.botToken) {
+          throw new ChatwootMissingTokenError("conversations/messages");
+        }
+        opts.notes?.push([conversationId, content]);
+        opts.order?.push("note");
+        return {};
+      },
+      toggleStatus: async (conversationId: number, status: string) => {
+        if (!cfg.botToken) {
+          throw new ChatwootMissingTokenError("conversations/toggle_status");
+        }
+        opts.toggles.push([conversationId, status]);
+        opts.order?.push("toggle");
+        return {};
+      },
+    }) as unknown as ChatwootClient;
 }
 
 function page(
@@ -160,7 +207,10 @@ async function seedConversation(
   convId: number,
   over: {
     assigneeType?: string | null;
+    assigneeId?: number | null;
     lastHandledMessageId?: number | null;
+    contactInboxId?: number | null;
+    status?: string;
   } = {},
 ) {
   await suDb.conversation.create({
@@ -168,12 +218,14 @@ async function seedConversation(
       tenantId,
       chatwootInstanceId: instanceId,
       chatwootConversationId: convId,
-      status: "pending",
+      status: over.status ?? "pending",
       assigneeType: over.assigneeType ?? null,
+      assigneeId: over.assigneeId ?? null,
       inboxId: inboxDbId,
       threadId: threadOf(convId),
       lastEventAt: new Date(),
       lastHandledMessageId: over.lastHandledMessageId ?? null,
+      contactInboxId: over.contactInboxId ?? null,
     },
   });
 }
@@ -205,6 +257,39 @@ async function watermarkOf(convId: number): Promise<number | null> {
     select: { lastHandledMessageId: true },
   });
   return row.lastHandledMessageId;
+}
+
+// The single line a correction leaves for the conversation Chatwoot calls `convId`.
+//
+// Polled and scoped, the two obligations tests/modules/flowlog-reader-scope.test.ts states:
+// emitFlowEvent is fire-and-forget, so an unpolled read races the write it asserts and an unscoped
+// one answers with a neighbour's row. The count is asserted before the line is read, because a
+// second line would mean two corrections raced and `[0]` of that answers with whichever landed
+// first instead of failing.
+async function convRowId(convId: number) {
+  const conv = await suDb.conversation.findFirstOrThrow({
+    where: { tenantId, chatwootConversationId: convId },
+    select: { id: true },
+  });
+  return conv.id;
+}
+
+async function correctionLine(convId: number) {
+  const conversationId = await convRowId(convId);
+  const deadline = Date.now() + 2000;
+  let lines: Array<{ level: string; detail: unknown }> = [];
+  while (Date.now() < deadline) {
+    lines = await flowLogRows(suDb, {
+      where: { tenantId, conversationId, stage: "delivery" },
+      select: { level: true, detail: true },
+    });
+    if (lines.length > 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  expect(lines).toHaveLength(1);
+  const line = lines[0];
+  if (line === undefined) throw new Error("no correction line was written");
+  return line;
 }
 
 describe.skipIf(!dbUp)("debounce", () => {
@@ -242,6 +327,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         },
       },
     });
+    agentDbId = agent.id;
     await suDb.chatwootAgentBot.create({
       data: {
         tenantId,
@@ -311,6 +397,7 @@ describe.skipIf(!dbUp)("debounce", () => {
     );
     const past = new Date(Date.now() - 60_000);
     await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "WEBHOOK_RETRY",
       dedupeKey: "dbc-wr",
@@ -403,6 +490,188 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe(t0.getTime());
   });
 
+  // /reset retires the burst, but a flush already CLAIMED is past every cancel — and this one is a
+  // queued TURN: coalescing and invoking rewrites the thread the command just cleared, with the
+  // operator having been told the conversation was started over. The reply is the smaller half.
+  //
+  // The assertions are the WRITES, not the reads. An early "did it fetch the messages" check proved
+  // only where the fence happened to sit, and it went green for a run that stood down before any of
+  // the three things that outlive the command: the thread claim, the invoke that persists the
+  // channel, and the watermark that would declare the burst handled.
+  test("a burst retired while claimed writes nothing", async () => {
+    // With a contact-inbox, so the divider/claim block under the `ingest:` lock runs — that is the
+    // first of the two boundaries the fence has to hold, and a conversation without one skips it.
+    await seedConversation(838, { contactInboxId: 8380 });
+    const thread = threadOf(838);
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "DEBOUNCE",
+        dedupeKey: debounceDedupeKey(thread),
+        status: "CLAIMED",
+        runAt: new Date(),
+        payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+      },
+      select: { id: true, claimSeq: true },
+    });
+    // What /reset does to it, while this run holds the claim.
+    await retireJobsByDedupeKey(
+      tenantId,
+      "DEBOUNCE",
+      debounceDedupeKey(thread),
+      suDb,
+    );
+    const sent: Array<[number, string]> = [];
+    const calls = { getMessages: 0 };
+    const saver = new MemorySaver();
+
+    const out = await flushDebounceJob({
+      // The payload the worker captured at claim time — before the stamp landed.
+      job: { ...jobFor(838), id: row.id, claimSeq: row.claimSeq },
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent,
+          calls,
+        }),
+        checkpointer: saver,
+      },
+    });
+
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    // The thread was not claimed, so nothing recreated what the command cleared.
+    expect(
+      await suDb.agentThread.count({
+        where: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId: 8380,
+        },
+      }),
+    ).toBe(0);
+    // And the burst was not declared handled: it was withdrawn with the thread, not answered.
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 838 },
+      select: { lastHandledMessageId: true },
+    });
+    expect(conv.lastHandledMessageId).toBeNull();
+    // The one that outlives the command: nothing was written to the channel the reset cleared.
+    expect(
+      await saver.getTuple({
+        configurable: {
+          thread_id: contactInboxThreadId(tenantId, instanceId, 8380),
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  // The same command, on the conversation shape that skips the block above entirely. Without a
+  // contact-inbox there is no `ingest:` lock and no thread claim, so the fence inside it never runs
+  // — and the invoke that persists the channel is still ahead. One ask per write, not one ask per
+  // conversation shape.
+  test("a burst retired while claimed writes nothing without a contact-inbox", async () => {
+    await seedConversation(839);
+    const thread = threadOf(839);
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "DEBOUNCE",
+        dedupeKey: debounceDedupeKey(thread),
+        status: "CLAIMED",
+        runAt: new Date(),
+        payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+      },
+      select: { id: true, claimSeq: true },
+    });
+    await retireJobsByDedupeKey(
+      tenantId,
+      "DEBOUNCE",
+      debounceDedupeKey(thread),
+      suDb,
+    );
+    const sent: Array<[number, string]> = [];
+    const saver = new MemorySaver();
+
+    const out = await flushDebounceJob({
+      job: { ...jobFor(839), id: row.id, claimSeq: row.claimSeq },
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: saver,
+      },
+    });
+
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    expect(
+      await saver.getTuple({
+        configurable: {
+          thread_id: chatwootThreadId(tenantId, instanceId, 839),
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  // And the widest window of the three: /reset arriving while the MODEL is running. Both asks above
+  // have already answered by then, and the reply is a send the customer reads — into a conversation
+  // the operator was told had been started over.
+  test("a burst retired during the model call is not answered", async () => {
+    await seedConversation(848);
+    const thread = threadOf(848);
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "DEBOUNCE",
+        dedupeKey: debounceDedupeKey(thread),
+        status: "CLAIMED",
+        runAt: new Date(),
+        payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+      },
+      select: { id: true, claimSeq: true },
+    });
+    const sent: Array<[number, string]> = [];
+    // The command lands INSIDE the generate call, which is the only way to reach the post gate with
+    // the two earlier asks having answered truthfully.
+    const retiring = new SideEffectModel(async () => {
+      await retireJobsByDedupeKey(
+        tenantId,
+        "DEBOUNCE",
+        debounceDedupeKey(thread),
+        suDb,
+      );
+    });
+
+    const out = await flushDebounceJob({
+      job: { ...jobFor(848), id: row.id, claimSeq: row.claimSeq },
+      base: appDb,
+      deps: {
+        makeModel: () => retiring as unknown as BaseChatModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 848 },
+      select: { lastHandledMessageId: true },
+    });
+    expect(conv.lastHandledMessageId).toBeNull();
+  });
+
   test("flush coalesces the burst into one reply and advances the watermark", async () => {
     await seedConversation(800);
     const sent: Array<[number, string]> = [];
@@ -428,6 +697,756 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(out).toEqual({ outcome: "done" });
     expect(sent).toEqual([[800, REPLY]]);
     expect(await watermarkOf(800)).toBe(2);
+  });
+
+  test("a flush retires the ledger row of a message it rescued", async () => {
+    // The half of issue #228 that makes the sweep's question answerable, and the reason there is no
+    // watermark arithmetic left in the classifier.
+    //
+    // Message 1's delivery died mid-processing, so its ledger row sits non-terminal with nothing
+    // working it. Message 2 arrives and arms a flush, and the flush re-reads the WHOLE thread from
+    // Chatwoot rather than the message that armed it — so message 1 is in the burst and does get
+    // answered. Nothing about the conversation's watermarks can express that afterwards, but the
+    // turn knows it, so it says so on the row.
+    const convId = 880;
+    await seedConversation(convId);
+    const stranded = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-rescue-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    const sent: Array<[number, string]> = [];
+    const out = await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "tem horário?" },
+            ]),
+          ],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([[convId, REPLY]]);
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: stranded.id },
+      select: { status: true, processedAt: true },
+    });
+    expect(row.status).toBe("PROCESSED");
+    expect(row.processedAt).not.toBeNull();
+
+    // And QUIETLY. The correction line exists to close an alert that already went out, so an
+    // ordinary rescue — a row nobody had reported yet — must not write one, or every burst that
+    // happens to cover a strand pages somebody about a problem they never heard of.
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(
+      await flowLogCount(suDb, {
+        where: { tenantId, conversationId: conv.id, stage: "delivery" },
+      }),
+    ).toBe(0);
+
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: stranded.id } });
+  });
+
+  test("the burst CAP takes messages out, and the ledger says so too", async () => {
+    // The cap is a deliberate omission: the flush re-read the thread, LOOKED at these messages and
+    // answered only the newest N. The watermark advances past the whole burst all the same, so the
+    // dropped ones are declared handled by the conversation and would be declared lost by the
+    // ledger — and the sweep's whole worth is that a row in its list is a customer nothing reached.
+    // Reporting a message the product deliberately dropped is the same lie from the other side.
+    const convId = 889;
+    await seedConversation(convId);
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentDbId },
+      select: { settings: true },
+    });
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: {
+        settings: {
+          ...(before.settings as object),
+          debounce: {
+            enabled: true,
+            windowSeconds: 15,
+            maxMessagesPerBurst: 1,
+            maxWindowSeconds: 60,
+          },
+        },
+      },
+    });
+    // Message 1's own delivery died mid-processing. The cap then drops it from the burst this
+    // flush answers, so nothing will ever reply to it — deliberately.
+    const capped = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-capped-${process.pid}`,
+        event: "message_created",
+        // DEAD: the sweep already reported this one and an operator is holding the alert. That is
+        // what makes the settlement WORD observable — and the reply that went out answered the
+        // burst it was GIVEN, never this message, so the correction has to say consumed.
+        status: "DEAD",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    const sent: Array<[number, string]> = [];
+    try {
+      const out = await flushDebounceJob({
+        job: jobFor(convId),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStub({
+            pages: [
+              page([
+                { id: 1, content: "oi" },
+                { id: 2, content: "tem horário?" },
+              ]),
+            ],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([[convId, REPLY]]);
+      expect(
+        (
+          await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+            where: { id: capped.id },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe("PROCESSED");
+      expect((await correctionLine(convId)).detail).toMatchObject({
+        outcome: "consumed_late",
+      });
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: before.settings as object },
+      });
+      await suDb.chatwootWebhookDelivery.delete({ where: { id: capped.id } });
+      await clearFlowLog(suDb, { tenantId });
+    }
+  });
+
+  test("a flush stopped by a closed gate settles the ledger too", async () => {
+    // The gate exits decide before any Chatwoot fetch: they advance the watermark from the payload's
+    // own lastMessageId and return. A delivery that armed this flush and then died is sitting
+    // PROCESSING, and left there it becomes a reported loss for a message the product deliberately
+    // declined to answer — a human holds the conversation, and reporting "nobody answered" about it
+    // is exactly the wrong thing to page someone with.
+    //
+    // The exit knows the burst only as "everything up to this id", which is what the watermark it
+    // writes says, so the retirement takes the same range. Sound as a WRITE at the moment of the
+    // decision, in a way reading a watermark afterwards never was.
+    const convId = 886;
+    // The watermark already sits at 2: messages 1 and 2 had their fate decided before this flush
+    // was ever armed.
+    await seedConversation(convId, {
+      assigneeType: "User",
+      lastHandledMessageId: 2,
+    });
+    const before = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-gate-before-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        // BELOW the watermark: nothing about this gate exit is a decision about it.
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    const level = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-gate-level-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        // Exactly AT the watermark: the last message the previous decision covered.
+        inboundMessageId: 2,
+      },
+      select: { id: true },
+    });
+    const stranded = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-gate-exit-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: 3,
+      },
+      select: { id: true },
+    });
+    const top = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-gate-top-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        // Exactly AT the payload's lastMessageId: the message this very flush was armed for, and
+        // the one the exit is deciding about right now. The top bound is inclusive for it.
+        inboundMessageId: 5,
+      },
+      select: { id: true },
+    });
+    const later = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-gate-beyond-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        // ABOVE the payload's lastMessageId: it arrived after the arm, so this gate exit says
+        // nothing about it.
+        inboundMessageId: 9,
+      },
+      select: { id: true },
+    });
+    const out = await flushDebounceJob({
+      job: jobFor(convId, { lastMessageId: 5 }),
+      base: appDb,
+      deps: {
+        makeModel: () => {
+          throw new Error("the gate must close before any model call");
+        },
+        makeClient: async () => {
+          throw new Error("the gate must close before any Chatwoot fetch");
+        },
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: stranded.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSED");
+    // And ONLY the burst, bounded at BOTH ends.
+    //
+    // Above: a message that arrived after the arm is not in the payload, so the gate never decided
+    // about it.
+    const beyond = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: later.id },
+      select: { status: true },
+    });
+    expect(beyond.status).toBe("PROCESSING");
+    // Below: a strand from BEFORE the watermark belongs to an earlier decision, or to none. Left
+    // open at the bottom, this exit reaches back over it and closes a real loss for good — message 1
+    // strands, message 2 arrives on a human-owned conversation and carries the watermark past both,
+    // and then a gated flush for message 5 swallows message 1 without anything ever answering it.
+    const earlier = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: before.id },
+      select: { status: true },
+    });
+    expect(earlier.status).toBe("PROCESSING");
+    // And the boundary is STRICT: the message sitting exactly AT the watermark is the last one
+    // something else already decided, so it belongs to that decision and not to this one.
+    const atMark = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: level.id },
+      select: { status: true },
+    });
+    expect(atMark.status).toBe("PROCESSING");
+    // The other end is INCLUSIVE, and asymmetrically so on purpose: the lower bound is a decision
+    // already made, the upper bound is the decision being made. The message that armed this flush is
+    // the one most in need of retiring — excluded, every gated flush leaves behind a reported loss
+    // for the exact message it just declined to answer.
+    const atTop = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: top.id },
+      select: { status: true },
+    });
+    expect(atTop.status).toBe("PROCESSED");
+
+    await suDb.chatwootWebhookDelivery.deleteMany({
+      where: {
+        id: { in: [stranded.id, later.id, before.id, level.id, top.id] },
+      },
+    });
+  });
+
+  test("a gate closed by ANOTHER BOT leaves the ledger alone", async () => {
+    // The same exit, closed by the one state whose settlement may not widen.
+    //
+    // Chatwoot fans a message to up to two routes — `agent_bots_for` returns the conversation's
+    // assignee bot and the inbox's bot, each with its own delivery id — so a message inside this
+    // burst can have a SECOND ledger row belonging to the bot that now owns the conversation, and
+    // that row can be `PROCESSING` because its turn is running right now. A range write turns it
+    // `PROCESSED`, the one state the sweep never revisits; if that route then dies, the customer it
+    // was answering is unanswered with nothing anywhere saying so.
+    //
+    // The direct webhook path already scopes to its own row here. The flush has no row of its own to
+    // scope to, so it retires nothing: the price is a strand of OURS staying in the loss list while
+    // another bot answers the customer, which is wrong and visible rather than quiet and wrong.
+    //
+    // The watermark still advances, and that half is not a detail: it is what keeps a later flush
+    // from re-coalescing this burst and answering over the bot that took the conversation.
+    const convId = 890;
+    await seedConversation(convId, {
+      assigneeType: "AgentBot",
+      // Not 9, which is the bot this job runs as.
+      assigneeId: 77,
+      lastHandledMessageId: 2,
+    });
+    const sibling = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-gate-sibling-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        // Squarely inside the range this exit would otherwise take.
+        inboundMessageId: 4,
+      },
+      select: { id: true },
+    });
+    const out = await flushDebounceJob({
+      job: jobFor(convId, { lastMessageId: 5 }),
+      base: appDb,
+      deps: {
+        makeModel: () => {
+          throw new Error("the gate must close before any model call");
+        },
+        makeClient: async () => {
+          throw new Error("the gate must close before any Chatwoot fetch");
+        },
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: sibling.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSING");
+    expect(await watermarkOf(convId)).toBe(5);
+
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: sibling.id } });
+  });
+
+  test("an EMPTY turn closes a reported loss the same way: consumed, not answered", async () => {
+    // The gate exits are silence by construction, but the flush's own success path is not: it fires
+    // for every outcome that consumed the burst, and only "posted" reached the customer. An empty
+    // model reply consumed the message and sent nothing, so the correction has to say consumed —
+    // otherwise the one caller that CAN tell the difference is the one that reports it wrong.
+    const convId = 888;
+    await seedConversation(convId);
+    const reported = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `empty-corrects-${process.pid}`,
+        event: "message_created",
+        status: "DEAD",
+        processedAt: new Date(Date.now() - 60_000),
+        receivedAt: new Date(Date.now() - 120_000),
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    const sent: Array<[number, string]> = [];
+    await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(sent).toEqual([]);
+
+    const line = await correctionLine(convId);
+    expect((line.detail as Record<string, unknown>).outcome).toBe(
+      "consumed_late",
+    );
+
+    await clearFlowLog(suDb, { conversationId: await convRowId(convId) });
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: reported.id } });
+  });
+
+  test("a gate exit closes a reported loss WITHOUT claiming the customer was answered", async () => {
+    // The correction line has to say which thing happened. A gate exit is a deliberate silence by
+    // definition — it decides before any model call — so closing a reported loss from one and
+    // logging "answered late" would hand an operator a resolution nobody delivered, which is the
+    // same class of lie as hiding the loss in the first place.
+    const convId = 887;
+    await seedConversation(convId, { assigneeType: "User" });
+    const reported = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `gate-corrects-${process.pid}`,
+        event: "message_created",
+        status: "DEAD",
+        processedAt: new Date(Date.now() - 60_000),
+        receivedAt: new Date(Date.now() - 120_000),
+        conversationId: convId,
+        inboundMessageId: 3,
+      },
+      select: { id: true },
+    });
+    await flushDebounceJob({
+      job: jobFor(convId, { lastMessageId: 5 }),
+      base: appDb,
+      deps: {
+        makeModel: () => {
+          throw new Error("the gate must close before any model call");
+        },
+        makeClient: async () => {
+          throw new Error("the gate must close before any Chatwoot fetch");
+        },
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(
+      (
+        await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+          where: { id: reported.id },
+          select: { status: true },
+        })
+      ).status,
+    ).toBe("PROCESSED");
+
+    const line = await correctionLine(convId);
+    expect((line.detail as Record<string, unknown>).outcome).toBe(
+      "consumed_late",
+    );
+
+    await clearFlowLog(suDb, { conversationId: await convRowId(convId) });
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: reported.id } });
+  });
+
+  test("a flush does not consume a PENDING row it has not been claimed from", async () => {
+    // The retirement is a blind write into a state machine somebody else owns, and PENDING is the
+    // state where that owner has not arrived yet. The ack is spent before the ledger row is even
+    // inserted, so a burst re-read from Chatwoot legitimately contains a message whose own delivery
+    // is sitting between its insert and its CAS. Retired there, that delivery's CAS matches nothing
+    // and it returns "skipped" — the mirror write never runs, and `lastInboundAt`, the contact and
+    // the attribute bags stay behind.
+    //
+    // So the retirement takes PROCESSING only, and this row must survive a burst that contains it.
+    const convId = 885;
+    await seedConversation(convId);
+    const fresh = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-fresh-pending-${process.pid}`,
+        event: "message_created",
+        // Inserted a moment ago and not claimed: its own delivery is about to CAS it.
+        status: "PENDING",
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: fresh.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PENDING");
+
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: fresh.id } });
+  });
+
+  test("a flush does not retire a strand on another Chatwoot ACCOUNT", async () => {
+    // Display ids and message ids are numbered per Chatwoot account, so one tenant with two
+    // connected accounts genuinely has two conversation 884s carrying two message 1s — the mirror
+    // says so by keying conversations on [tenant, instance, conversation]. The retirement is a
+    // blind-write by those ids, so without the instance in its predicate a burst on one account
+    // closes a real loss on the other, and closes it permanently: the row goes terminal and no
+    // later sweep pass ever looks at it again.
+    const convId = 884;
+    await seedConversation(convId);
+    const other = await seedChatwootInstance(suDb, {
+      tenantId,
+      accountId: 4242,
+      baseUrl: "https://chat.other.example",
+      adminToken: encryptJson("ADMIN"),
+    });
+    const strandedElsewhere = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        // Same tenant, same conversation number, same message number. Different ACCOUNT.
+        chatwootInstanceId: other.id,
+        deliveryId: `flush-other-instance-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: strandedElsewhere.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSING");
+
+    await suDb.chatwootWebhookDelivery.delete({
+      where: { id: strandedElsewhere.id },
+    });
+  });
+
+  test("a flush leaves a strand the burst did NOT contain alone", async () => {
+    // The regression test for the finding that killed the watermark design for good. Message 1's
+    // delivery died. Message 2 arrived while the conversation was human-owned, so the webhook
+    // advanced the handled watermark past BOTH without answering either. Message 3 then arms a
+    // flush, and the burst floor is now the watermark — so the burst is {3} and message 1 is NOT in
+    // it. Nothing covered message 1, and its row must stay non-terminal to say so.
+    //
+    // Every version of this that read a watermark closed this row: the mark ends up past message 1
+    // whether it counts skips or only posts, because the burst that posted started ABOVE it.
+    const convId = 882;
+    await seedConversation(convId);
+    await advanceHandledWatermark({
+      tenantId,
+      conversationDbId: (
+        await suDb.conversation.findFirstOrThrow({
+          where: { tenantId, chatwootConversationId: convId },
+          select: { id: true },
+        })
+      ).id,
+      toMessageId: 2,
+      base: appDb,
+    });
+    const stranded = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-excluded-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    const sent: Array<[number, string]> = [];
+    await flushDebounceJob({
+      job: jobFor(convId, { lastMessageId: 3 }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "alguém aí?" },
+              { id: 3, content: "por favor" },
+            ]),
+          ],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    // The reply went out, for message 3 alone.
+    expect(sent).toEqual([[convId, REPLY]]);
+    // And message 1 is still on the books as unanswered, which is the whole point.
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: stranded.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSING");
+
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: stranded.id } });
+  });
+
+  test("a flush CORRECTS a row already reported as a loss, and says so", async () => {
+    // An earlier round of this PR asserted the opposite, and had confused the RECORD with the
+    // WORKLIST. The record is the flow line, written once and never rewritten; `WHERE status =
+    // 'DEAD'` is the worklist, and it answers "who is still unanswered". A turn that ran over the
+    // message is direct evidence against a verdict the sweep reached by INFERENCE — nothing has
+    // moved this row — so the evidence wins and the row leaves the worklist.
+    //
+    // It happens two ways: the sweep firing in the sliver between a turn posting and the retirement,
+    // and a long-reported message finally answered by a burst that reached back past it. In both the
+    // customer has a reply, and leaving the row in the list sends an operator to a conversation
+    // where there is nothing to do.
+    //
+    // Nothing is erased. The loss line stays, and a second line joins it saying how it ended —
+    // without that, the row would simply vanish from the list while the alert an operator already
+    // received stands with nothing to close it.
+    const convId = 883;
+    await seedConversation(convId);
+    const reported = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-already-dead-${process.pid}`,
+        event: "message_created",
+        status: "DEAD",
+        processedAt: new Date(Date.now() - 60_000),
+        receivedAt: new Date(Date.now() - 120_000),
+        conversationId: convId,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: reported.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSED");
+
+    // And the correction is on the record, at warn rather than error: something did go wrong, and
+    // it ended with the customer answered.
+    const line = await correctionLine(convId);
+    expect(line.level).toBe("warn");
+    expect((line.detail as Record<string, unknown>).outcome).toBe(
+      "answered_late",
+    );
+
+    await clearFlowLog(suDb, { conversationId: await convRowId(convId) });
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: reported.id } });
+  });
+
+  test("a flush leaves a stranded row on ANOTHER conversation alone", async () => {
+    // The retirement is scoped by conversation as well as by message id, and a Chatwoot message id
+    // is unique per account rather than per conversation — but the ids in a test fixture are not, and
+    // neither are they across instances. Without the conversation in the WHERE, a burst would retire
+    // a neighbour's strand and hide a real loss.
+    const convId = 881;
+    await seedConversation(convId);
+    const other = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `flush-neighbour-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        // A DIFFERENT conversation, carrying a message id the burst below also contains.
+        conversationId: 9_999,
+        inboundMessageId: 1,
+      },
+      select: { id: true },
+    });
+    await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: other.id },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSING");
+
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: other.id } });
   });
 
   test("a re-flush with nothing past the watermark posts nothing (idempotent)", async () => {
@@ -567,6 +1586,152 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(811)).toBeNull();
   });
 
+  // The write AFTER the send, and the one the outcome must not follow. /reset landing while the
+  // reply is going out cannot un-send it — but the deferred resolve is a separate write, and closing
+  // a conversation the operator has just cleared and handed back to the agent is the attendance
+  // ended. So the resolve is skipped and the turn still reports what it delivered: a "stale" here
+  // would leave the watermark behind and hand the burst to a flush that answers it twice.
+  test("a reset landing on the reply keeps the reply and drops the resolve", async () => {
+    await seedConversation(849);
+    const thread = threadOf(849);
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "DEBOUNCE",
+        dedupeKey: debounceDedupeKey(thread),
+        status: "CLAIMED",
+        runAt: new Date(),
+        payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+      },
+      select: { id: true, claimSeq: true },
+    });
+    const sent: Array<[number, string]> = [];
+    const toggles: Array<[number, string]> = [];
+    const calls = { getMessages: 0 };
+    const makeClient = makeResolveStub({
+      pages: [page([{ id: 1, content: "oi" }])],
+      sent,
+      calls,
+      toggles,
+    });
+    // The command lands ON the send: everything before it answered truthfully, and the resolve is
+    // the only write still ahead. Built with the persona token the real loader would hand it (the
+    // fixture's `BOT`), because this one instance is handed straight to the flush.
+    const client = await makeClient({ botToken: "BOT" });
+    const holder = client as unknown as Record<
+      string,
+      (...a: never[]) => unknown
+    >;
+    const innerSend = holder.sendMessage?.bind(client);
+    holder.sendMessage = (async (...args: never[]) => {
+      await retireJobsByDedupeKey(
+        tenantId,
+        "DEBOUNCE",
+        debounceDedupeKey(thread),
+        suDb,
+      );
+      return innerSend?.(...args);
+    }) as (...a: never[]) => unknown;
+
+    const out = await flushDebounceJob({
+      job: { ...jobFor(849), id: row.id, claimSeq: row.claimSeq },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new ResolveThenReplyModel("Fechado!") as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(out).toEqual({ outcome: "done" });
+    // The reply reached the customer — it was already leaving when the command landed.
+    expect(sent).toEqual([[849, "Fechado!"]]);
+    // The close did not.
+    expect(toggles).toEqual([]);
+  });
+
+  // The typing pause, which is the wait NO other fence covers: it sits between the per-balloon ask
+  // and the send it guards, inside `deliverReply`. A reset landing there leaves the loop with zero
+  // balloons delivered, and zero is not a delivery.
+  //
+  // The watermark is NOT what separates the two readings here — `shouldPost` claims the burst as its
+  // CAS well before this, so it has already moved either way. What separates them is the word: a
+  // turn reported as "posted" clears the conversation's error, announcing to the operator that the
+  // agent answered, when nothing left.
+  test("a reset landing in the typing pause leaves the burst unanswered", async () => {
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentDbId },
+      select: { settings: true },
+    });
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: {
+        settings: { ...(before.settings as object), split: { enabled: true } },
+      },
+    });
+    try {
+      await seedConversation(863);
+      // A failure the operator is looking at. Only a delivered turn is allowed to take it away.
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: 863 },
+        data: { lastError: "boom", lastErrorAt: new Date() },
+      });
+      const thread = threadOf(863);
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceDedupeKey(thread),
+          status: "CLAIMED",
+          runAt: new Date(),
+          payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+        },
+        select: { id: true, claimSeq: true },
+      });
+      const sent: Array<[number, string]> = [];
+
+      const out = await flushDebounceJob({
+        job: { ...jobFor(863), id: row.id, claimSeq: row.claimSeq },
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeStub({
+            pages: [page([{ id: 1, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+          // The command commits during the pause before the FIRST balloon.
+          sleep: async () => {
+            await retireJobsByDedupeKey(
+              tenantId,
+              "DEBOUNCE",
+              debounceDedupeKey(thread),
+              suDb,
+            );
+          },
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 863 },
+        select: { lastError: true },
+      });
+      expect(conv.lastError).toBe("boom");
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: before.settings as object },
+      });
+    }
+  });
+
   test("a human assignee closes the gate before any Chatwoot fetch", async () => {
     await seedConversation(802, { assigneeType: "User" });
     const sent: Array<[number, string]> = [];
@@ -587,6 +1752,668 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(out).toEqual({ outcome: "done" });
     expect(sent).toEqual([]);
     expect(calls.getMessages).toBe(0);
+  });
+
+  // NOTE: Our bot is 9 (the job payload's agentBotId, and the ChatwootAgentBot row); 77 is another
+  // bot on the same account. The burst was armed while the conversation was still free and an
+  // automation handed it away before the window closed, so the flush is the last place that can
+  // notice.
+  test("another bot took the conversation: the flush gate closes before any Chatwoot fetch", async () => {
+    await seedConversation(850, { assigneeType: "AgentBot", assigneeId: 77 });
+    const sent: Array<[number, string]> = [];
+    const calls = { getMessages: 0 };
+    const out = await flushDebounceJob({
+      job: jobFor(850),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent,
+          calls,
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    expect(calls.getMessages).toBe(0);
+  });
+
+  // The bail that must not preempt the gate. Reading the inbox before the gate is what lets a closed
+  // gate name its agent, and moving the "no agent bound" exit up with it would silently change what
+  // the gate DOES: the burst would stop counting as handled, sit below the watermark, and be
+  // re-coalesced and answered after a later rebind. Attribution is worth a nullable id; it is not
+  // worth that.
+  test("a closed gate on an unbound inbox still consumes the burst", async () => {
+    await seedConversation(873, { assigneeType: "User" });
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: 7301,
+        name: "Sem agente",
+        agentId: null,
+      },
+      select: { id: true },
+    });
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: 873 },
+      data: { inboxId: inbox.id },
+    });
+    const out = await flushDebounceJob({
+      job: jobFor(873, { lastMessageId: 21 }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 21, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(await watermarkOf(873)).toBe(21);
+  });
+
+  // A gate that closes has to SAY why it closed, and this one said nothing at all: the burst counted
+  // as handled and the flush returned, so the operator investigating an unanswered conversation
+  // found no line anywhere (issue #271). The two cases below are the two events that wear this one
+  // exit, and the second is the one the ack escalation produces — the case the distinction exists
+  // for, and the one that never reaches the recheck that could already name it, because no turn
+  // ever starts.
+  //
+  // Scoped to the conversation asked for, by its INTERNAL id, and polled: the emit is
+  // fire-and-forget, so an unscoped read answers with a neighbour's row and an unpolled one races
+  // the write it is asserting.
+  async function handoffDetailOf(convId: number): Promise<unknown> {
+    const conversation = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    for (let i = 0; i < 40; i++) {
+      const row = await flowLogRow(suDb, {
+        where: { tenantId, stage: "handoff", conversationId: conversation.id },
+        orderBy: { id: "desc" },
+      });
+      if (row) return row.detail;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return null;
+  }
+
+  async function routeRowOf(convId: number) {
+    const conversation = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    for (let i = 0; i < 40; i++) {
+      const row = await flowLogRow(suDb, {
+        where: { tenantId, stage: "route", conversationId: conversation.id },
+        orderBy: { id: "desc" },
+      });
+      if (row) return row;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return null;
+  }
+
+  // The OTHER unbound-inbox exit, and the one nothing recorded: the gate is OPEN, so this burst is
+  // the bot's to answer and there is simply no agent to answer it. It ended as a silent `done`
+  // (issue #318), which from the operator's side is indistinguishable from an agent that is quiet.
+  test("an unbound inbox with the gate open leaves the line that names the inbox", async () => {
+    await seedConversation(874);
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: 7302,
+        name: "Recem-conectada",
+        agentId: null,
+      },
+      select: { id: true },
+    });
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: 874 },
+      data: { inboxId: inbox.id },
+    });
+    const sent: Array<[number, string]> = [];
+    const out = await flushDebounceJob({
+      job: jobFor(874, { lastMessageId: 31 }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 31, content: "oi" }])],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    const row = await routeRowOf(874);
+    expect(row?.level).toBe("warn");
+    expect(row?.status).toBe("skipped");
+    expect(row?.agentId).toBeNull();
+    expect(row?.inboxId).toBe(inbox.id);
+    expect(row?.detail).toEqual({ outcome: "no_agent", chatwootInboxId: 7302 });
+    // The burst is NOT consumed: an open gate on an inbox that gets bound later has to answer it,
+    // which is exactly what the bail's position below the gate buys. The line does not change that.
+    expect(await watermarkOf(874)).toBeNull();
+  });
+
+  test("a gate closed by a human writes the handoff line that names the takeover", async () => {
+    await seedConversation(870, { assigneeType: "User" });
+    const out = await flushDebounceJob({
+      job: jobFor(870),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(await handoffDetailOf(870)).toEqual({ outcome: "taken_over" });
+  });
+
+  // The ack escalation, as the flush meets it: Chatwoot moved the conversation out of `pending`
+  // with nobody on the other side, seconds after a slow ack, and the flush that fires next is the
+  // last place that can report it.
+  test("a gate closed by the escalation names the status that closed it", async () => {
+    await seedConversation(871, { status: "open" });
+    const out = await flushDebounceJob({
+      job: jobFor(871),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(await handoffDetailOf(871)).toEqual({
+      outcome: "ownership_lost",
+      status: "open",
+    });
+  });
+
+  // NOTE: The same seat held by OUR bot: assignment to ourselves is the normal steady state once
+  // the agent has taken a conversation, so closing the gate on it would silence every burst.
+  test("our own bot holding the conversation does not close the flush gate", async () => {
+    await seedConversation(851, { assigneeType: "AgentBot", assigneeId: 9 });
+    const sent: Array<[number, string]> = [];
+    const calls = { getMessages: 0 };
+    await flushDebounceJob({
+      job: jobFor(851),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [page([{ id: 1, content: "oi" }])],
+          sent,
+          calls,
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(calls.getMessages).toBeGreaterThan(0);
+    expect(sent).toHaveLength(1);
+  });
+
+  // The webhook checks every incoming message, but a turn is not a message: one allowed message can
+  // arm a flush that a later, refused message rides into, and a verdict revoked inside the window is
+  // the same hole from the other side. The check belongs where a turn begins, so it runs here too.
+  describe("with the contact-authorization gate on", () => {
+    let previousSettings: unknown = null;
+
+    beforeAll(async () => {
+      const before = await suDb.agent.findUniqueOrThrow({
+        where: { id: agentDbId },
+        select: { settings: true },
+      });
+      previousSettings = before.settings;
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            contactAuth: {
+              enabled: true,
+              url: "https://203.0.113.9:9443/check",
+            },
+          },
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: previousSettings as object },
+      });
+    });
+
+    async function seedContactOn(convId: number, chatwootContactId: number) {
+      const contact = await suDb.contact.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootContactId,
+          phone: `+5511955550${chatwootContactId}`,
+        },
+        select: { id: true },
+      });
+      await suDb.conversation.update({
+        where: {
+          tenantId_chatwootInstanceId_chatwootConversationId: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: convId,
+          },
+        },
+        data: { contactId: contact.id },
+      });
+    }
+
+    const answering = (authorized: boolean, calls: { n: number }) =>
+      (async () => {
+        calls.n += 1;
+        return new Response(JSON.stringify({ authorized }), { status: 200 });
+      }) as unknown as typeof fetch;
+
+    // The flush asks the endpoint again at the point the turn begins, so the facts it volunteers are
+    // as fresh as the verdict that allowed the burst. Asserted on the prompt the model received:
+    // the block is built elsewhere and this is the only thing that proves this path wires it.
+    test("an allowed contact's facts reach the model of the coalesced turn", async () => {
+      await seedConversation(844);
+      await seedContactOn(844, 65);
+      const sent: Array<[number, string]> = [];
+      const calls = { getMessages: 0 };
+      const model = new PromptCapturingModel("Claro!");
+      const out = await flushDebounceJob({
+        job: jobFor(844, { lastMessageId: 9 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model,
+          makeClient: makeStub({
+            pages: [page([{ id: 9, content: "oi" }])],
+            sent,
+            calls,
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: (async () =>
+            new Response(
+              JSON.stringify({
+                authorized: true,
+                context: { plan: "premium" },
+              }),
+              { status: 200 },
+            )) as unknown as typeof fetch,
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([[844, "Claro!"]]);
+      expect(model.systemPrompts[0] ?? "").toContain(
+        '<campo chave="plan" valor="premium"/>',
+      );
+    });
+
+    // The escalation lands INSIDE the authorization round-trip, which is what that fence exists for:
+    // ten seconds in somebody else's endpoint. The old line here asserted a human takeover, which is
+    // the reading #225 measured as wrong, and this is the state that proves it — nobody is on the
+    // conversation at all.
+    test("the conversation leaving mid-authorization is reported as what it was", async () => {
+      await seedConversation(872);
+      await seedContactOn(872, 72);
+      const sent: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(872, { lastMessageId: 11 }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStub({
+            pages: [page([{ id: 11, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: (async () => {
+            await suDb.conversation.updateMany({
+              where: {
+                tenantId,
+                chatwootInstanceId: instanceId,
+                chatwootConversationId: 872,
+              },
+              data: { status: "open" },
+            });
+            return new Response(JSON.stringify({ authorized: true }), {
+              status: 200,
+            });
+          }) as unknown as typeof fetch,
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(await handoffDetailOf(872)).toEqual({
+        outcome: "ownership_lost",
+        status: "open",
+      });
+    });
+
+    test("a refused contact drops the burst: no fetch, no post, watermark advanced", async () => {
+      await seedConversation(840);
+      await seedContactOn(840, 61);
+      const sent: Array<[number, string]> = [];
+      const calls = { getMessages: 0 };
+      const auth = { n: 0 };
+      const out = await flushDebounceJob({
+        job: jobFor(840, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent,
+            calls,
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: answering(false, auth),
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(auth.n).toBe(1);
+      expect(sent).toEqual([]);
+      // Asked before any Chatwoot work, and the burst still counts as handled so the job does not
+      // come back for the same messages.
+      expect(calls.getMessages).toBe(0);
+      expect(await watermarkOf(840)).toBe(7);
+    });
+
+    test("a refused contact settles the ledger by RANGE: the conversation is still ours", async () => {
+      // The third gate exit, and the one that keeps the wide scope. The other two close because
+      // somebody else owns the conversation; this one closes because of a decision about the
+      // CONTACT, taken while this route still owns it — so there is no sibling delivery racing it,
+      // and a strand inside the burst is one this exit is entitled to close.
+      //
+      // Scoped down to nothing here, every refused burst would leave behind a reported loss for a
+      // message the product deliberately declined to answer, which is the silence issue #228 exists
+      // to remove.
+      await seedConversation(846);
+      await seedContactOn(846, 67);
+      const stranded = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `auth-refused-strand-${process.pid}`,
+          event: "message_created",
+          status: "PROCESSING",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: 846,
+          inboundMessageId: 4,
+        },
+        select: { id: true },
+      });
+      const out = await flushDebounceJob({
+        job: jobFor(846, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent: [],
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: answering(false, { n: 0 }),
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(
+        (
+          await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+            where: { id: stranded.id },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe("PROCESSED");
+
+      await suDb.chatwootWebhookDelivery.delete({ where: { id: stranded.id } });
+    });
+
+    // The authorization call is a round-trip to somebody else's endpoint with a ten-second ceiling.
+    // A message arriving and being REFUSED during it has already had the watermark advanced past it
+    // by its own delivery, so the burst must be chosen against the watermark as it stands THEN, not
+    // as it was when the flush started. Against the stale value the refused message would reach the
+    // model, and the post gate would only withhold the reply, after the tools had run.
+    test("a refusal landing during the check keeps its message out of the burst", async () => {
+      await seedConversation(842);
+      await seedContactOn(842, 63);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 842 },
+        select: { id: true },
+      });
+      const sent: Array<[number, string]> = [];
+      // What the defect is about is the MODEL running, not the reply going out: the post gate's CAS
+      // already withholds a reply whose watermark moved, which is why asserting on `sent` alone
+      // passes with the fix reverted. Counting the model is what separates "did not answer" from
+      // "never ran", and a turn that ran spent tokens and may have called side-effecting tools.
+      let modelBuilds = 0;
+      const countingModel = () => {
+        modelBuilds += 1;
+        return fakeModel();
+      };
+      // The concurrent refusal, played out while this flush is asking the endpoint: message 9 is
+      // refused by its own delivery, which advances the watermark over it.
+      const fetchImpl = (async () => {
+        await advanceHandledWatermark({
+          tenantId,
+          conversationDbId: conv.id,
+          toMessageId: 9,
+          base: appDb,
+        });
+        return new Response('{"authorized":true}', { status: 200 });
+      }) as unknown as typeof fetch;
+      const out = await flushDebounceJob({
+        job: jobFor(842),
+        base: appDb,
+        deps: {
+          makeModel: countingModel,
+          makeClient: makeStub({
+            pages: [page([{ id: 9, content: "e esse aqui?" }])],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: fetchImpl,
+        },
+      });
+      // Nothing left to answer: the only message in the page is already past the watermark.
+      expect(out).toEqual({ outcome: "done" });
+      expect(modelBuilds).toBe(0);
+      expect(sent).toEqual([]);
+    });
+
+    test("an authorized contact flushes as usual", async () => {
+      await seedConversation(841);
+      await seedContactOn(841, 62);
+      const sent: Array<[number, string]> = [];
+      const auth = { n: 0 };
+      const out = await flushDebounceJob({
+        job: jobFor(841),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStub({
+            pages: [page([{ id: 1, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: answering(true, auth),
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(auth.n).toBe(1);
+      expect(sent).toEqual([[841, REPLY]]);
+    });
+
+    // The window the gate opens: the assignee gate runs before a round-trip that can take ten
+    // seconds, so a human arriving inside it used to get the burst answered over their shoulder.
+    // The post gate withholds the reply, but by then the turn's tools have run.
+    test("a human taking over during the authorization call ends the flush before the model", async () => {
+      await seedConversation(843);
+      await seedContactOn(843, 64);
+      // A strand inside the burst, to pin WHICH settlement a human takeover takes. A human answers
+      // the message whichever route carried it, so this exit keeps the wide range — the narrow
+      // scoping below is for another BOT and for nothing else.
+      const stranded = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `auth-human-strand-${process.pid}`,
+          event: "message_created",
+          status: "PROCESSING",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: 843,
+          inboundMessageId: 4,
+        },
+        select: { id: true },
+      });
+      const sent: Array<[number, string]> = [];
+      const calls = { getMessages: 0 };
+      let modelBuilds = 0;
+      const takeOverThenAllow = (async () => {
+        await suDb.conversation.updateMany({
+          where: { tenantId, chatwootConversationId: 843 },
+          data: { assigneeType: "User", status: "open" },
+        });
+        return new Response(JSON.stringify({ authorized: true }), {
+          status: 200,
+        });
+      }) as unknown as typeof fetch;
+      const out = await flushDebounceJob({
+        job: jobFor(843, { lastMessageId: 9 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            modelBuilds += 1;
+            return fakeModel();
+          },
+          makeClient: makeStub({
+            pages: [page([{ id: 1, content: "oi" }])],
+            sent,
+            calls,
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: takeOverThenAllow,
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(modelBuilds).toBe(0);
+      expect(sent).toEqual([]);
+      // Handled all the same: the human owns the burst now, so the next flush after they hand the
+      // conversation back must not re-answer it. Same rule as a gate that was already closed.
+      expect(await watermarkOf(843)).toBe(9);
+      expect(
+        (
+          await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+            where: { id: stranded.id },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe("PROCESSED");
+
+      await suDb.chatwootWebhookDelivery.delete({ where: { id: stranded.id } });
+    });
+
+    test("ANOTHER BOT taking over during the authorization call leaves the ledger alone", async () => {
+      // The same window, closed by the other kind of owner, and the settlement differs because the
+      // two owners mean different things. A human answers the message whichever route carried it;
+      // another BOT has a delivery of its own that may be running right now, and Chatwoot fans a
+      // message to up to two routes (`agent_bots_for`). Retiring by range here turns that live row
+      // `PROCESSED`, the one state the sweep never revisits.
+      //
+      // This exit is the second place the rule has to hold, and it is not reachable from the first:
+      // the gate on the way in passed, and the conversation moved during a ten-second round-trip to
+      // somebody else's endpoint.
+      await seedConversation(845);
+      await seedContactOn(845, 66);
+      const sibling = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `auth-recheck-sibling-${process.pid}`,
+          event: "message_created",
+          status: "PROCESSING",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: 845,
+          inboundMessageId: 4,
+        },
+        select: { id: true },
+      });
+      const sent: Array<[number, string]> = [];
+      let modelBuilds = 0;
+      const botTakesOverThenAllow = (async () => {
+        await suDb.conversation.updateMany({
+          where: { tenantId, chatwootConversationId: 845 },
+          // Still `pending`, and assigned to a bot that is not the 9 this job runs as: the state
+          // `describeClosedGate` calls `ownership_lost` rather than `taken_over`.
+          data: { assigneeType: "AgentBot", assigneeId: 77 },
+        });
+        return new Response(JSON.stringify({ authorized: true }), {
+          status: 200,
+        });
+      }) as unknown as typeof fetch;
+      const out = await flushDebounceJob({
+        job: jobFor(845, { lastMessageId: 9 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            modelBuilds += 1;
+            return fakeModel();
+          },
+          makeClient: makeStub({
+            pages: [page([{ id: 1, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+          contactAuthFetch: botTakesOverThenAllow,
+        },
+      });
+      expect(out).toEqual({ outcome: "done" });
+      expect(modelBuilds).toBe(0);
+      expect(sent).toEqual([]);
+      // Untouched, and the watermark still advances so a later flush cannot answer over the bot
+      // that took the conversation.
+      expect(
+        (
+          await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+            where: { id: sibling.id },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe("PROCESSING");
+      expect(await watermarkOf(845)).toBe(9);
+
+      await suDb.chatwootWebhookDelivery.delete({ where: { id: sibling.id } });
+    });
   });
 
   // ── Issue #8: the watermark must advance on every deliberate skip, not only on a post ──
@@ -696,6 +2523,122 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(sent).toEqual([]);
     expect(calls.getMessages).toBe(0);
     expect(await watermarkOf(806)).toBe(12);
+  });
+
+  // Issue #339. The DEBOUNCE dedupeKey is the THREAD, so one physical row serves every burst this
+  // contact ever sends. A flush that dead-lettered (five consecutive failures) left the row carrying
+  // five attempts, and the re-arm only ever wrote status/run_at/payload, so the NEXT burst, days
+  // later, got exactly one attempt before being retired again, forever.
+  //
+  // A fresh burst is not a guess here: it is the same thing `burstStartedAt` already keys off, a row
+  // that is not PENDING, and both are asserted so the two cannot drift apart.
+  test("a burst after a dead-lettered flush starts with the whole budget", async () => {
+    await suDb.$executeRawUnsafe(
+      `DELETE FROM scheduler_jobs WHERE tenant_id = ${tenantId}`,
+    );
+    const thread = threadOf(702);
+    const cfg = {
+      enabled: true,
+      windowSeconds: 15,
+      maxMessagesPerBurst: 20,
+      maxWindowSeconds: 60,
+    };
+    const t0 = new Date(Date.now() - 600_000);
+    await armDebounce({
+      tenantId,
+      threadId: thread,
+      agentBotId: 9,
+      cfg,
+      base: appDb,
+      now: t0,
+    });
+    const armed = await suDb.schedulerJob.findFirstOrThrow({
+      where: {
+        tenantId,
+        kind: "DEBOUNCE",
+        dedupeKey: debounceDedupeKey(thread),
+      },
+      select: { id: true },
+    });
+    await suDb.schedulerJob.update({
+      where: { id: armed.id },
+      data: { attempts: 5, status: "DEAD" },
+    });
+
+    const t1 = new Date(t0.getTime() + 300_000);
+    await armDebounce({
+      tenantId,
+      threadId: thread,
+      agentBotId: 9,
+      cfg,
+      base: appDb,
+      now: t1,
+    });
+    const row = await suDb.schedulerJob.findUniqueOrThrow({
+      where: { id: armed.id },
+      select: { status: true, attempts: true, payload: true },
+    });
+    expect(row.status).toBe("PENDING");
+    expect(row.attempts).toBe(0);
+    expect((row.payload as { burstStartedAt: number }).burstStartedAt).toBe(
+      t1.getTime(),
+    );
+  });
+
+  // The control for the test above, and the reason the answer is not just "always clear it": while a
+  // burst is still open, a re-arm is the SAME flush being pushed out by another message. A flush that
+  // failed and is waiting on its backoff must not be handed five more attempts by every message the
+  // contact types.
+  test("re-arming inside a burst keeps the attempts that burst has spent", async () => {
+    await suDb.$executeRawUnsafe(
+      `DELETE FROM scheduler_jobs WHERE tenant_id = ${tenantId}`,
+    );
+    const thread = threadOf(703);
+    const cfg = {
+      enabled: true,
+      windowSeconds: 15,
+      maxMessagesPerBurst: 20,
+      maxWindowSeconds: 60,
+    };
+    const t0 = new Date(Date.now() - 10_000);
+    await armDebounce({
+      tenantId,
+      threadId: thread,
+      agentBotId: 9,
+      cfg,
+      base: appDb,
+      now: t0,
+    });
+    const armed = await suDb.schedulerJob.findFirstOrThrow({
+      where: {
+        tenantId,
+        kind: "DEBOUNCE",
+        dedupeKey: debounceDedupeKey(thread),
+      },
+      select: { id: true },
+    });
+    // The flush failed twice: failJob re-pends with a backoff, so the row is PENDING and the burst
+    // is still the same one.
+    await suDb.schedulerJob.update({
+      where: { id: armed.id },
+      data: { attempts: 2 },
+    });
+    await armDebounce({
+      tenantId,
+      threadId: thread,
+      agentBotId: 9,
+      cfg,
+      base: appDb,
+      now: new Date(t0.getTime() + 5_000),
+    });
+    const row = await suDb.schedulerJob.findUniqueOrThrow({
+      where: { id: armed.id },
+      select: { attempts: true, payload: true },
+    });
+    expect(row.attempts).toBe(2);
+    expect((row.payload as { burstStartedAt: number }).burstStartedAt).toBe(
+      t0.getTime(),
+    );
   });
 
   test("armDebounce keeps the burst's highest lastMessageId across re-arms", async () => {
@@ -917,5 +2860,795 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(model.seen[0]).toContain(
       "<mensagem-de-audio>vim do meta do fork</mensagem-de-audio>",
     );
+  });
+  // The post gate is not one question. `shouldPost` re-fetches the conversation from Chatwoot and
+  // THEN runs the watermark CAS, so a /reset landing inside that round trip arrives after the ask
+  // that precedes it — and the input-guardrail reply is the send that sits closest to the gate, with
+  // nothing in between to ask again.
+  //
+  // The supersede half cannot stand in for the ask, and the redirect pair is why: a /reset typed on
+  // the ENTRY conversation retires the WIDGET's flush (webhook.ts sweeps both sides), while the
+  // re-fetch reads the widget's own messages, where nothing new arrived. The gate sees a quiet
+  // conversation and claims the burst.
+  describe("with an input guardrail that answers", () => {
+    const GUARD_MODEL = "guard-sentinel";
+    let previousSettings: unknown = null;
+
+    beforeAll(async () => {
+      const before = await suDb.agent.findUniqueOrThrow({
+        where: { id: agentDbId },
+        select: { settings: true },
+      });
+      previousSettings = before.settings;
+      const key = await suDb.vaultEntry.findFirstOrThrow({
+        where: { tenantId, name: "llm-key" },
+        select: { id: true },
+      });
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            guardrails: {
+              enabled: true,
+              provider: "openai",
+              model: GUARD_MODEL,
+              credentialRef: `vault:${key.id}`,
+              input: {
+                enabled: true,
+                action: "template",
+                checks: {
+                  toxicity: true,
+                  unsafeContent: false,
+                  competitorMentions: false,
+                  promptAdherence: false,
+                },
+                templateMessage: "TEMPLATE-IN",
+              },
+              output: { enabled: false },
+            },
+          },
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: previousSettings as object },
+      });
+    });
+
+    test("a burst retired inside the post gate is not answered", async () => {
+      await seedConversation(862);
+      const thread = threadOf(862);
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceDedupeKey(thread),
+          status: "CLAIMED",
+          runAt: new Date(),
+          payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+        },
+        select: { id: true, claimSeq: true },
+      });
+      const sent: Array<[number, string]> = [];
+      // `getMessages` runs twice on this path: the burst fetch, then the supersede re-fetch inside
+      // the gate. The command lands in the SECOND, which is the window the asks around it leave.
+      let fetches = 0;
+      const client = {
+        getMessages: async () => {
+          fetches += 1;
+          if (fetches === 2) {
+            await retireJobsByDedupeKey(
+              tenantId,
+              "DEBOUNCE",
+              debounceDedupeKey(thread),
+              suDb,
+            );
+          }
+          return page([{ id: 1, content: "vocês são uns inúteis" }]);
+        },
+        sendMessage: async (conversationId: number, content: string) => {
+          sent.push([conversationId, content]);
+          return {};
+        },
+        sendPrivateNote: async () => ({}),
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+      const verdict = JSON.stringify({
+        violated: true,
+        categories: ["toxicity"],
+        rationale: "abuse",
+      });
+
+      const out = await flushDebounceJob({
+        job: { ...jobFor(862), id: row.id, claimSeq: row.claimSeq },
+        base: appDb,
+        deps: {
+          makeModel: (cfg: ResolvedModelConfig) =>
+            cfg.model === GUARD_MODEL
+              ? guardrailModel(async () => ({ content: verdict }))
+              : fakeModel(),
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The gate was actually reached — otherwise this test would pass on a turn that stood down
+      // somewhere harmless upstream.
+      expect(fetches).toBe(2);
+      // And the customer got nothing after their reset, template included.
+      expect(sent).toEqual([]);
+      // The residual, asserted rather than left to be discovered: the only ask that can catch this
+      // window answers after the CAS, so the burst is marked handled without having been answered.
+      // The alternative is the send above.
+      expect(await watermarkOf(862)).toBe(1);
+    });
+  });
+  // A turn that answers with BOTH an attachment and text, retired between the two. The image is with
+  // the customer and the words never arrive, so the burst is half answered — and "stale" would hand
+  // it to the next flush, which sends that attachment a second time. Same rule as the two branches
+  // that already read `images.sent`, and the third place it has to hold.
+  describe("with a turn that sends an image before its reply", () => {
+    const IMG_URL = "https://cdn.loja.com.br/produtos/camiseta.png";
+    const imageDeps = {
+      fetchImpl: (async () =>
+        new Response(
+          // A real PNG signature: the tool sniffs the bytes before it uploads.
+          new Uint8Array([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00,
+            0x0d,
+          ]),
+          {
+            status: 200,
+            headers: { "content-type": "image/png" },
+          },
+        )) as unknown as typeof fetch,
+      assertSafe: async (u: string) => new URL(u),
+    };
+    let previousSettings: unknown = null;
+
+    beforeAll(async () => {
+      const before = await suDb.agent.findUniqueOrThrow({
+        where: { id: agentDbId },
+        select: { settings: true },
+      });
+      previousSettings = before.settings;
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            sendImage: { allowedHosts: ["cdn.loja.com.br"] },
+          },
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: previousSettings as object },
+      });
+    });
+
+    test("a burst retired after the image still counts as answered", async () => {
+      await seedConversation(864);
+      // A failure the operator is looking at. Only a turn that DELIVERED takes it away, so this is
+      // what tells "posted" from "stale" here — the watermark cannot, because the post gate's CAS
+      // advanced it before either word was chosen.
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: 864 },
+        data: { lastError: "boom", lastErrorAt: new Date() },
+      });
+      const thread = threadOf(864);
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceDedupeKey(thread),
+          status: "CLAIMED",
+          runAt: new Date(),
+          payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+        },
+        select: { id: true, claimSeq: true },
+      });
+      const sent: Array<[number, string]> = [];
+      const attachments: string[] = [];
+      const client = {
+        getMessages: async () => page([{ id: 1, content: "manda a foto" }]),
+        sendFileAttachment: async (
+          _c: number,
+          _b: ArrayBuffer,
+          name: string,
+        ) => {
+          attachments.push(name);
+          // The command lands with the picture already delivered and the words still owed.
+          await retireJobsByDedupeKey(
+            tenantId,
+            "DEBOUNCE",
+            debounceDedupeKey(thread),
+            suDb,
+          );
+          return {};
+        },
+        sendMessage: async (conversationId: number, content: string) => {
+          sent.push([conversationId, content]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const out = await flushDebounceJob({
+        job: { ...jobFor(864), id: row.id, claimSeq: row.claimSeq },
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new SendImageThenReplyModel(
+              "É essa aqui!",
+              IMG_URL,
+            ) as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The picture went out and the words did not.
+      expect(attachments).toHaveLength(1);
+      expect(sent).toEqual([]);
+      // And the turn counts as answered: the error cleared, which only a delivered turn does.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 864 },
+        select: { lastError: true },
+      });
+      expect(conv.lastError).toBeNull();
+    });
+  });
+
+  // The clean stale returns are fenced at every wait. This is the branch that reaches a write WITHOUT
+  // passing any of them: a throw unwinds straight past them into the handler's catch.
+  describe("with a turn that throws after the command retired it", () => {
+    // Retires the claim from inside the model call and then rejects, which is the shape the reviewer
+    // named: /reset lands while the invoke (or a TTS call, or a send) is in flight, and that call
+    // then fails.
+    const retireThenThrow = (thread: string) =>
+      new SideEffectModel(async () => {
+        await retireJobsByDedupeKey(
+          tenantId,
+          "DEBOUNCE",
+          debounceDedupeKey(thread),
+          suDb,
+        );
+        throw new Error("boom");
+      }) as unknown as BaseChatModel;
+
+    async function runThrowingFlush(convId: number, retire: boolean) {
+      await seedConversation(convId);
+      const thread = threadOf(convId);
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceDedupeKey(thread),
+          status: "CLAIMED",
+          runAt: new Date(),
+          payload: { threadId: thread, agentBotId: 9, burstStartedAt: 1 },
+        },
+        select: { id: true, claimSeq: true },
+      });
+      const model = retire
+        ? retireThenThrow(thread)
+        : (new SideEffectModel(async () => {
+            throw new Error("boom");
+          }) as unknown as BaseChatModel);
+      const sent: Array<[number, string]> = [];
+      const calls = { getMessages: 0 };
+      const err = await flushDebounceJob({
+        job: { ...jobFor(convId), id: row.id, claimSeq: row.claimSeq },
+        base: appDb,
+        deps: {
+          makeModel: () => model,
+          makeClient: makeStub({
+            pages: [page([{ id: 1, content: "oi" }])],
+            sent,
+            calls,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      // Rethrown either way: the scheduler still has to see the attempt fail. Only the bookkeeping
+      // changes, and asserting this keeps the fence from quietly swallowing the failure instead.
+      expect(err).toBeInstanceOf(Error);
+      return suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: convId },
+        select: { lastError: true, lastErrorAt: true },
+      });
+    }
+
+    test("a throw from a retired run does not put the failure back", async () => {
+      const conv = await runThrowingFlush(865, true);
+      // `lastError`/`lastErrorAt` are what /reset clears. Recording them here would raise the banner
+      // the operator was just told had been taken down, over a turn no retry is coming for.
+      expect(conv.lastError).toBeNull();
+      expect(conv.lastErrorAt).toBeNull();
+    });
+
+    test("a throw from a run nobody retired still records the failure", async () => {
+      const conv = await runThrowingFlush(866, false);
+      expect(conv.lastError).not.toBeNull();
+      expect(conv.lastErrorAt).not.toBeNull();
+    });
+  });
+
+  // THE SECOND ASK (issue #146). The webhook's spend gate covers the MESSAGE; the flush runs minutes
+  // later and is where the turn actually spends. A tenant that crosses its ceiling inside that
+  // window — from its own other conversations, or from this one's earlier burst — would otherwise
+  // have an already-armed flush spend past it, and many armed conversations would do it together.
+  describe("with the spend ceiling reached between arming and the flush", () => {
+    let previousTenantSettings: unknown = null;
+    // The OPERATOR'S sentence, deliberately not the shipped default: an expectation written against
+    // the defaults object would also pass on a flush that ignored the configuration entirely and
+    // hard-coded the same string.
+    const CEILING_COPY = "Orçamento do mês esgotado, já chamei alguém.";
+
+    beforeAll(async () => {
+      const before = await suDb.tenant.findUniqueOrThrow({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      previousTenantSettings = before.settings;
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            spendCeiling: {
+              enabled: true,
+              monthlyInboxTokens: 1000,
+              overCeilingMessage: CEILING_COPY,
+            },
+          },
+        },
+      });
+      await suDb.llmUsage.create({
+        data: {
+          tenantId,
+          model: "gpt-4o-mini",
+          source: "inbox",
+          promptTokens: 1200,
+          completionTokens: 0,
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await suDb.llmUsage.deleteMany({ where: { tenantId } });
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: { settings: previousTenantSettings as object },
+      });
+    });
+
+    test("the flush spends nothing, says why, hands off, and counts the burst as handled", async () => {
+      await seedConversation(910);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const order: string[] = [];
+      const out = await flushDebounceJob({
+        job: jobFor(910, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          // The assertion is the factory: a flush that reaches the model at all fails here.
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+            order,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // THE WHOLE CONTRACT, not a piece of it. This refusal is the first one the conversation gets,
+      // so the customer hears the operator's sentence here or never: the handoff below takes the
+      // conversation out of `pending`, and from then on no message of theirs reaches a gate again.
+      expect(sent).toEqual([[910, CEILING_COPY]]);
+      // ...the conversation goes to the human queue, because unlike a refused contact nobody
+      // upstream refused anything, so it would otherwise sit with a bot that will never answer...
+      expect(toggles).toEqual([[910, "open"]]);
+      // ...and the operator gets the reason, which has to say the handoff HAPPENED. The note is
+      // asserted on the clause the handoff decides rather than on the whole rendered string: the
+      // digits go through `toLocaleString`, and pinning them here would pin the runner's ICU too.
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.[0]).toBe(910);
+      expect(notes[0]?.[1]).toContain("limite de tokens do mês foi atingido");
+      expect(notes[0]?.[1]).toContain("aberta para atendimento humano");
+      // The ORDER, which is load-bearing in both directions: the copy leaves before the open,
+      // because after it the conversation is no longer the bot's and the fence would rightly
+      // withhold it; the note comes last, because it is the only one that can report whether the
+      // handoff happened.
+      expect(order).toEqual(["message", "toggle", "note"]);
+      // The burst counts as handled, so it is not re-flushed into the same wall forever.
+      expect(await watermarkOf(910)).toBe(7);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // A HUMAN CLAIMING THE CONVERSATION WHILE THE GATE DECIDES. The gate at the top of the flush
+    // judged the instant before two database reads, and `open` is not a neutral write: it ends the
+    // bot's attribution and puts the conversation back in the routing queue, so applying it to a
+    // conversation an agent just took pulls it out of their hands.
+    //
+    // The window is opened where it really is — inside the ledger read — by an extended client that
+    // flips the assignee the first time the ceiling's own query runs. That is the same seam the
+    // fail-open test uses, and it is the only one that reproduces the ordering without a sleep.
+    test("a human who claims the conversation during the read keeps it", async () => {
+      await seedConversation(912);
+      let flipped = 0;
+      const raced = appDb.$extends({
+        query: {
+          async $allOperations({ operation, args, query }) {
+            if (operation === "$queryRaw" && flipped === 0) {
+              const sql = ((args as { strings?: string[] }).strings ?? []).join(
+                " ",
+              );
+              if (sql.includes("FROM llm_usage")) {
+                flipped += 1;
+                await suDb.conversation.updateMany({
+                  where: {
+                    tenantId,
+                    chatwootInstanceId: instanceId,
+                    chatwootConversationId: 912,
+                  },
+                  data: { assigneeType: "User", assigneeId: 4242 },
+                });
+              }
+            }
+            return query(args);
+          },
+        },
+      }) as unknown as typeof appDb;
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(912, { lastMessageId: 11 }),
+        base: raced,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 11, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The window this test is about actually opened; without this the assertion below would pass
+      // on a run where the ledger read never happened.
+      expect(flipped).toBe(1);
+      // The conversation is the human's now, so the gate leaves the status alone and says nothing
+      // over their shoulder...
+      expect(toggles).toEqual([]);
+      expect(sent).toEqual([]);
+      // ...but the operator still gets the note, which is the one of the three that a takeover does
+      // not withhold: it is invisible to the customer, and a conversation a human just inherited is
+      // exactly where the reason for the silence still needs saying. It reports NO handoff, because
+      // none happened.
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.[1]).toContain("limite de tokens do mês foi atingido");
+      expect(notes[0]?.[1]).not.toContain("aberta para atendimento humano");
+      // ...and the burst still counts as handled, exactly as it does when the gate was already
+      // closed on the way in: the ceiling decided about the TENANT, and that holds either way.
+      expect(await watermarkOf(912)).toBe(11);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // A BURST THAT WAS ALREADY ANSWERED IS NOT A BURST TO REFUSE. A claimed job can be retried after
+    // an earlier attempt advanced the watermark past this payload's own last id: that attempt
+    // answered the burst and died before the scheduler could mark the job done. Over the ceiling,
+    // the retry would tell the customer the agent cannot answer, hand the conversation off, and
+    // write a refusal, all about a burst the customer already has an answer to.
+    test("a burst an earlier attempt already answered is not refused again", async () => {
+      await seedConversation(914);
+      // What that earlier attempt left behind, and the only trace of it this retry can read.
+      await advanceHandledWatermark({
+        tenantId,
+        conversationDbId: (
+          await suDb.conversation.findFirstOrThrow({
+            where: { tenantId, chatwootConversationId: 914 },
+            select: { id: true },
+          })
+        ).id,
+        toMessageId: 15,
+        base: appDb,
+      });
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(914, { lastMessageId: 15 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            // The re-fetch finds the same message, and the watermark is what makes it not pending.
+            pages: [page([{ id: 15, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(toggles).toEqual([]);
+      expect(notes).toEqual([]);
+      // ...and no refusal line, because nothing was refused.
+      await settleFlowEvents();
+      const rows = await flowLogRows(suDb, {
+        // Scoped to this flush's own thread, not to the tenant: the fixture is shared with the
+        // refusals above, and a tenant-wide read would be asserting about their rows too.
+        where: { tenantId, threadId: threadOf(914), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // THE COMMAND, LANDING ON THE REFUSAL. `/reset` retires the burst, and a flush already claimed is
+    // past every cancel — the same window the turn path fences with `stillWanted`. Ownership cannot
+    // stand in for it here: the reset hands the conversation BACK to the bot, so the gate says yes
+    // at exactly the moment the command has said no. Nothing may be said, nothing reopened, and the
+    // burst must not be declared handled: it was withdrawn, not answered.
+    test("a burst retired while claimed is not told about the ceiling", async () => {
+      await seedConversation(913);
+      const thread = threadOf(913);
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceDedupeKey(thread),
+          status: "CLAIMED",
+          runAt: new Date(),
+          payload: {
+            threadId: thread,
+            agentBotId: 9,
+            burstStartedAt: 1,
+            lastMessageId: 13,
+          },
+        },
+        select: { id: true, claimSeq: true },
+      });
+      await retireJobsByDedupeKey(
+        tenantId,
+        "DEBOUNCE",
+        debounceDedupeKey(thread),
+        suDb,
+      );
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: {
+          ...jobFor(913, { lastMessageId: 13 }),
+          id: row.id,
+          claimSeq: row.claimSeq,
+        },
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 13, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(toggles).toEqual([]);
+      expect(notes).toEqual([]);
+      // ...AND NO LINE, which is the half the acts above do not cover. The refusal is a write like
+      // the other three: `over` is `error` severity, so the line pages the alert channels, and the
+      // announcement CLAIMS the notice window as it decides — a line about a withdrawn burst would
+      // also swallow the window a real refusal needs later. The shape of the row this asserts the
+      // absence of is proved by the refusals in the sibling tests above.
+      await settleFlowEvents();
+      const rows = await flowLogRows(suDb, {
+        // This flush's own thread, not the tenant: the fixture is shared with those refusals.
+        where: { tenantId, threadId: threadOf(913), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+      // The one that outlives the command: the burst is still the customer's.
+      expect(await watermarkOf(913)).toBeNull();
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // ONE LINE PER REFUSED BURST, not one per attempt at it. Advancing the watermark is the LAST
+    // thing the refusing branch does and it is a database write, so a flush that says its piece and
+    // then dies is re-pended by the scheduler and runs again on the same burst — a second `error`
+    // line and a second page to the alert channels about one refusal.
+    //
+    // The retry is modelled by putting the conversation back in the state a crashed settlement
+    // leaves it in: the copy went out, the watermark did not move. Running the same job again from
+    // there is exactly what the worker does.
+    test("a burst refused twice by a retried job is one line, not two", async () => {
+      await seedConversation(916);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const run = () =>
+        flushDebounceJob({
+          job: jobFor(916, { lastMessageId: 19 }),
+          base: appDb,
+          deps: {
+            makeModel: () => {
+              throw new Error("the model must not be invoked over the ceiling");
+            },
+            makeClient: makeResolveStub({
+              pages: [page([{ id: 19, content: "oi" }])],
+              sent,
+              calls: { getMessages: 0 },
+              toggles,
+              notes,
+            }),
+            checkpointer: new MemorySaver(),
+          },
+        });
+
+      expect(await run()).toEqual({ outcome: "done" });
+      // What the crash left behind: settled nothing.
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: 916 },
+        data: { lastHandledMessageId: null },
+      });
+      expect(await run()).toEqual({ outcome: "done" });
+
+      await settleFlowEvents();
+      const rows = await flowLogRows(suDb, {
+        where: { tenantId, threadId: threadOf(916), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.level).toBe("error");
+      // The customer hears it once too, which is the notice cooldown rather than this key: two
+      // fences over one retry, and both are asserted because either one alone would pass while the
+      // other was broken.
+      expect(sent).toHaveLength(1);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // NOTHING TO ANSWER ⇒ NOTHING TO REFUSE, and the watermark cannot see this one. The burst was
+    // never answered — an earlier attempt did not run — but the message it armed on is gone from the
+    // thread, or renders to no answerable text. Without the ceiling that burst reaches
+    // `coalesceAndRunTurn`, which returns "empty" and says nothing to anybody; over it, the refusal
+    // would send the operator's sentence to a customer who is not waiting for one and put the
+    // conversation in a human's queue over a burst with nothing in it.
+    test("a burst with nothing answerable in it is not refused", async () => {
+      await seedConversation(915);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(915, { lastMessageId: 17 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            // The message the job armed on is gone from the thread — deleted between the arming and
+            // this flush. The other shape of "nothing answerable" (a message with no text and no
+            // attachment) reaches the same answer through the same selector, which drops it before
+            // it can be rendered.
+            pages: [page([])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(toggles).toEqual([]);
+      expect(notes).toEqual([]);
+      // ...and no refusal line, because nothing was refused.
+      await settleFlowEvents();
+      const rows = await flowLogRows(suDb, {
+        where: { tenantId, threadId: threadOf(915), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+      // And the watermark is exactly where an empty burst leaves it outside the ceiling: untouched,
+      // because nothing was answered and nothing was withdrawn. The branch that DOES settle it is
+      // the one where a real message renders to nothing and never will.
+      expect(await watermarkOf(915)).toBeNull();
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    test("with handoff off, the burst is still dropped and no status is touched", async () => {
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...(previousTenantSettings as object),
+            spendCeiling: {
+              enabled: true,
+              monthlyInboxTokens: 1000,
+              overCeilingMessage: CEILING_COPY,
+              handoffEnabled: false,
+            },
+          },
+        },
+      });
+      await seedConversation(911);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(911, { lastMessageId: 9 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 9, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The copy and the note do NOT depend on the handoff: with the open switched off the customer
+      // is the only one who can tell the agent went quiet, and this burst is the last chance to say
+      // it — the conversation stays `pending`, but nothing re-delivers the burst already dropped.
+      expect(sent).toEqual([[911, CEILING_COPY]]);
+      expect(toggles).toEqual([]);
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.[1]).not.toContain("aberta para atendimento humano");
+      expect(await watermarkOf(911)).toBe(9);
+      await clearFlowLog(suDb, { tenantId });
+    });
   });
 });

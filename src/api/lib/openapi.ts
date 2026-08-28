@@ -10,9 +10,18 @@ import { type DocumentDecoration, type TSchema, t } from "elysia";
 // does not run through response validation either — so these annotations are documentation-only and
 // carry no runtime-validation risk.
 
-// The canonical error body every endpoint returns on failure: `{ error: "<message>" }`.
+// The canonical error body every endpoint returns on failure: `{ error: "<message>" }`, plus the
+// name of the value the refusal is about when it is about one (see src/api/lib/refusal.ts).
 export const ErrorResponse = t.Object(
-  { error: t.String({ description: "Human-readable error message." }) },
+  {
+    error: t.String({ description: "Human-readable error message." }),
+    field: t.Optional(
+      t.String({
+        description:
+          "The value the refusal is about, by the server's name for it (a column, a patch key, or a dotted path into a settings bag). Absent when the refusal is not about one input. Never localized.",
+      }),
+    ),
+  },
   { description: "Error response." },
 );
 
@@ -35,7 +44,11 @@ const STATUS_DESCRIPTION: Record<number, string> = {
   413: "Payload too large.",
   415: "Unsupported media type.",
   422: "Unprocessable — the input is syntactically valid but semantically rejected.",
-  429: "Too many requests — rate limited.",
+  // Two producers, and the routes that DECLARE it are the second kind: the rate limiter answers 429
+  // from its own handler on any route, without appearing in a response map, while a spend ceiling
+  // that has been reached is a documented outcome of the playground endpoints. A description naming
+  // only the limiter would be false about every route that lists this status.
+  429: "Too many requests — rate limited, or a spend ceiling has been reached.",
   502: "Bad gateway — an upstream dependency failed.",
 };
 
@@ -43,7 +56,7 @@ const STATUS_DESCRIPTION: Record<number, string> = {
 // builders can never drift apart in the published spec.
 function errorSchema(status: number): typeof ErrorResponse {
   return t.Object(
-    { error: t.String() },
+    { error: t.String(), field: t.Optional(t.String()) },
     { description: STATUS_DESCRIPTION[status] ?? "Error." },
   );
 }

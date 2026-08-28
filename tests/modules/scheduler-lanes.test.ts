@@ -3,8 +3,11 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import {
+  JOB_DEATH_LEVEL,
+  JOB_DELETE_ON_DONE,
   JOB_LANE,
   JOB_SPENDS_PROVIDER,
+  JOB_TRAFFIC_PROPORTIONAL,
   type SchedulerLane,
   sharedProviderConcurrency,
 } from "@/modules/scheduler/lanes";
@@ -12,10 +15,12 @@ import {
   claimDueCompactionJobs,
   claimDueDebounceJobs,
   claimDueJobs,
+  claimDueTrafficJobs,
   enqueueJob,
   type SchedulerJobKind,
 } from "@/modules/scheduler/service";
 import {
+  getJobHandler,
   registerJobHandler,
   runSchedulerTick,
 } from "@/modules/scheduler/worker";
@@ -77,6 +82,16 @@ const EXPECTED_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   REDIRECT_FOLLOWUP: "shared",
   DEBOUNCE: "debounce",
   MEMORY_COMPACT: "compaction",
+  // Shared: the turn drains its own thread before invoking (issue #194), so the tick cadence stops
+  // deciding correctness — and the debounce lane can be switched off entirely, which would have
+  // stranded every queued message on an install that does not use debounce.
+  INGEST_MESSAGE: "shared",
+  // Shared: a sweep with a cadence of minutes and one indexed query per tenant (issue #228).
+  DELIVERY_SWEEP: "shared",
+  // Shared: the message it answers has already waited out the sweep's staleness window, so a tick's
+  // wait is not what the customer feels, and the cap it needs is the shared lane's provider
+  // concurrency rather than a budget independent of the turns live customers are queueing for.
+  DELIVERY_RECOVERY: "shared",
 };
 
 // Same discipline as EXPECTED_LANE, and for a sharper reason: the bound test below can only
@@ -95,6 +110,80 @@ const EXPECTED_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   FLOWLOG_SWEEP: false,
   DEBOUNCE: false,
   MEMORY_COMPACT: false,
+  INGEST_MESSAGE: false,
+  // Reads and writes rows, emits log lines, invokes nothing: the sweep reports a stranded delivery
+  // and arms the recovery, rather than answering it itself (issue #295).
+  DELIVERY_SWEEP: false,
+  // It runs the delivery path, which runs a real turn: a model call plus whatever tools it decides
+  // to use. This is the reason the recovery is a kind of its own instead of work the sweep does.
+  DELIVERY_RECOVERY: true,
+};
+
+// Same discipline again, and both of these maps were added by the change that introduced
+// INGEST_MESSAGE — the only kind that is `true` in either. A behaviour test can only exercise that
+// one end to end, so what stops a SECOND kind from being flipped is this list and nothing else, and
+// the two failures are quiet ones: a kind marked traffic-proportional silently leaves the fixed-rate
+// batch and is drained at a quarter of the rate; a kind marked delete-on-done stops leaving a
+// completed row behind, and the rows nothing sweeps are simply gone.
+const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
+  INGEST_MESSAGE: true,
+  FOLLOWUP: false,
+  FOLLOWUP_SWEEP: false,
+  WEBHOOK_RETRY: false,
+  DEBOUNCE: false,
+  RAG_INGEST: false,
+  HEARTBEAT: false,
+  FLOWLOG_SWEEP: false,
+  APPOINTMENT_REMINDER: false,
+  REDIRECT_FOLLOWUP: false,
+  MEMORY_COMPACT: false,
+  DELIVERY_SWEEP: false,
+  // One row per stranded DELIVERY, and one sweep pass can declare a whole batch lost at once — the
+  // deploy that stranded them stranded every delivery in flight. Armed for `now`, they are the
+  // oldest rows too, which is the shape that fills the batch and starves a fixed-rate kind.
+  DELIVERY_RECOVERY: true,
+};
+
+const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
+  INGEST_MESSAGE: true,
+  FOLLOWUP: false,
+  FOLLOWUP_SWEEP: false,
+  WEBHOOK_RETRY: false,
+  DEBOUNCE: false,
+  RAG_INGEST: false,
+  HEARTBEAT: false,
+  FLOWLOG_SWEEP: false,
+  APPOINTMENT_REMINDER: false,
+  REDIRECT_FOLLOWUP: false,
+  MEMORY_COMPACT: false,
+  DELIVERY_SWEEP: false,
+  // The key names ONE ledger row — it has to, or a second stranded delivery would overwrite the
+  // first — so nothing reuses the row and the count grows with every delivery ever stranded. The
+  // record that the work happened is the ledger row, which is terminal either way.
+  DELIVERY_RECOVERY: true,
+};
+
+// Written out ON PURPOSE, like the tables above: derived, it would mirror whatever the source says.
+const EXPECTED_DEATH_LEVEL: Record<
+  SchedulerJobKind,
+  "info" | "warn" | "error"
+> = {
+  FOLLOWUP: "error",
+  FOLLOWUP_SWEEP: "error",
+  WEBHOOK_RETRY: "error",
+  DEBOUNCE: "error",
+  RAG_INGEST: "error",
+  HEARTBEAT: "error",
+  FLOWLOG_SWEEP: "error",
+  APPOINTMENT_REMINDER: "error",
+  REDIRECT_FOLLOWUP: "error",
+  MEMORY_COMPACT: "error",
+  INGEST_MESSAGE: "error",
+  DELIVERY_SWEEP: "error",
+  // The only kind whose death is not an `error`, which is why writing it out matters more here than
+  // anywhere else in this file: the sweep already paged about this exact delivery at `error`, and
+  // the DEAD ledger row is still the operator's worklist. What died is the automatic second attempt.
+  DELIVERY_RECOVERY: "warn",
 };
 
 const ALL_KINDS = Object.keys(EXPECTED_LANE) as SchedulerJobKind[];
@@ -124,6 +213,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     const ids = new Map<bigint, SchedulerJobKind>();
     for (const kind of ALL_KINDS) {
       const id = await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind,
         dedupeKey: `lane-${kind}`,
@@ -141,7 +231,16 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
         claimedBy.set(kind, [...(claimedBy.get(kind) ?? []), lane]);
       }
     };
+    // The shared lane is claimed in TWO halves — the fixed-rate kinds and the traffic-proportional
+    // ones — so that a kind whose row count follows inbound traffic cannot fill the batch and starve
+    // the rest (../../src/modules/scheduler/lanes.ts, JOB_TRAFFIC_PROPORTIONAL). Both are recorded
+    // as "shared", because they are one lane: what the assertion below still means is that no kind
+    // is claimed by two lanes or by none, and a kind dropped from BOTH halves fails it.
     record("shared", await claimDueJobs(50, appDb, new Date(), tenantId));
+    record(
+      "shared",
+      await claimDueTrafficJobs(50, appDb, new Date(), tenantId),
+    );
     record(
       "debounce",
       await claimDueDebounceJobs(50, appDb, new Date(), tenantId),
@@ -192,6 +291,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     });
 
     await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "HEARTBEAT",
       dedupeKey: "drain-first",
@@ -199,6 +299,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
       base: appDb,
     });
     await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "FLOWLOG_SWEEP",
       dedupeKey: "drain-second",
@@ -266,6 +367,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
 
     for (let i = 0; i < N; i++) {
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "APPOINTMENT_REMINDER",
         dedupeKey: `bound-costly-${i}`,
@@ -273,6 +375,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
         base: appDb,
       });
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "HEARTBEAT",
         dedupeKey: `bound-cheap-${i}`,
@@ -325,6 +428,12 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     // Which kinds the bound APPLIES to, stated independently of the source. One kind is exercised
     // above; the rest are only ever covered here.
     expect(JOB_SPENDS_PROVIDER).toEqual(EXPECTED_SPENDS_PROVIDER);
+    expect(JOB_TRAFFIC_PROPORTIONAL).toEqual(EXPECTED_TRAFFIC_PROPORTIONAL);
+    expect(JOB_DELETE_ON_DONE).toEqual(EXPECTED_DELETE_ON_DONE);
+    // What each kind's DEATH says to the operator (issue #356). Stated here for the same reason as
+    // the three above, and with one more: the answers currently agree, so no behavioural test can
+    // tell this table from a default. This is what says the thirteenth kind has to be asked.
+    expect(JOB_DEATH_LEVEL).toEqual(EXPECTED_DEATH_LEVEL);
   }, 30_000);
 
   // The production sizing, which the test above deliberately does not exercise: never the whole
@@ -349,6 +458,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     });
     try {
       const foreign = await enqueueJob({
+        rearm: "same-work",
         tenantId: other.id,
         kind: "WEBHOOK_RETRY",
         dedupeKey: "foreign",
@@ -381,6 +491,63 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     }
   });
 
+  // The shared tick claims in TWO parts so a traffic-proportional kind cannot fill the batch, and
+  // this is the half a mutation caught untested: the split is asserted at the claim functions, and
+  // deleting the second claim from the tick itself killed nothing. It is the third time in this
+  // change that a function was covered and its call site was not.
+  test("the shared tick drains both halves of its lane", async () => {
+    const fixed = await enqueueJob({
+      rearm: "same-work",
+      tenantId,
+      kind: "WEBHOOK_RETRY",
+      dedupeKey: "dk-tick-fixed",
+      runAt: past(),
+      base: appDb,
+    });
+    const traffic = await enqueueJob({
+      rearm: "same-work",
+      tenantId,
+      kind: "INGEST_MESSAGE",
+      dedupeKey: "dk-tick-traffic",
+      runAt: past(),
+      base: appDb,
+    });
+    const ran: SchedulerJobKind[] = [];
+    const previous = {
+      WEBHOOK_RETRY: getJobHandler("WEBHOOK_RETRY"),
+      INGEST_MESSAGE: getJobHandler("INGEST_MESSAGE"),
+    };
+    for (const kind of ["WEBHOOK_RETRY", "INGEST_MESSAGE"] as const) {
+      registerJobHandler(kind, async () => {
+        ran.push(kind);
+        return { outcome: "done" };
+      });
+    }
+    try {
+      await runSchedulerTick(appDb, {
+        staleMs: 300_000,
+        batchSize: 20,
+        tenantId,
+      });
+    } finally {
+      for (const [kind, handler] of Object.entries(previous)) {
+        if (handler) registerJobHandler(kind, handler);
+      }
+    }
+
+    expect(ran.sort()).toEqual(["INGEST_MESSAGE", "WEBHOOK_RETRY"]);
+    // Both rows are finished: the traffic half is DELETED on completion, the fixed one retired.
+    expect(await suDb.schedulerJob.count({ where: { id: traffic } })).toBe(0);
+    expect(
+      (
+        await suDb.schedulerJob.findUniqueOrThrow({
+          where: { id: fixed },
+          select: { status: true },
+        })
+      ).status,
+    ).toBe("DONE");
+  });
+
   test("a write that cannot reach the database is logged, and the batch still drains", async () => {
     // The regression `allSettled` introduces if nothing reads its results: the serial loop let an
     // infrastructure failure propagate out of the tick, where startScheduler logged it. runClaimed
@@ -395,6 +562,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
 
     for (const key of ["reject-a", "reject-b"]) {
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "WEBHOOK_RETRY",
         dedupeKey: key,
