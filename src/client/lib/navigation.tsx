@@ -149,28 +149,25 @@ export interface SupportContact {
 // The email itself is i18n-driven so projects can route support to a
 // locale-specific inbox. Set to null to hide the support block entirely.
 // t('nav.support', 'Support')
-// t('support.email', 'support@fazer.ai')
+// t('support.email', 'support@wootytalk.com')
 export const SUPPORT_LINK: SupportContact | null = {
   emailKey: "support.email",
-  defaultEmail: "support@fazer.ai",
+  defaultEmail: "support@wootytalk.com",
   labelKey: "nav.support",
   defaultLabel: "Support",
   icon: LifeBuoy,
 };
 
-// t('nav.website', 'fazer.ai')
+// t('nav.website', 'wootytalk')
 // t('nav.github', 'GitHub')
-// Always the public open-source repo — even in Pro/Full (whose own repo is private): the user can
-// only open the public one. Used for the footer GitHub link AND the "new version" upgrade link, so
-// both point at fazer-ai/agents regardless of edition (never the hub).
-export const AGENTS_REPO_URL = "https://github.com/fazer-ai/agents";
+export const AGENTS_REPO_URL = "https://github.com/WootyTalk/agent-manager";
 
 export const SECONDARY_LINKS: FooterLink[] = [
   {
     id: "website",
-    href: "https://fazer.ai",
+    href: "https://wootytalk.com",
     labelKey: "nav.website",
-    defaultLabel: "fazer.ai",
+    defaultLabel: "wootytalk",
     icon: Globe,
   },
   {
@@ -182,6 +179,5 @@ export const SECONDARY_LINKS: FooterLink[] = [
   },
 ];
 
-// Upgrade destination for Pro-gated features (the hub's agents page). Centralized here, alongside
-// the other external links, so every <ProGate> CTA and any future upsell point at one URL.
-export const UPGRADE_URL = "https://app.fazer.ai/#/agents";
+// Project repository for documentation and releases
+export const UPGRADE_URL = AGENTS_REPO_URL;

@@ -45,9 +45,9 @@ const {
   TRUST_PROXY,
   TRUSTED_PROXY_HOPS,
   BUN_PUBLIC_EDITION,
-  FAZER_AI_HUB_URL,
-  AGENTS_UPDATE_CHECK_URL,
-  HUB_UPDATES_TTL_MS,
+  
+  
+  
   AGENT_MODEL_CONCURRENCY,
   AGENT_PROMPT_MAX_CHARS,
   DB_POOL_MAX,
@@ -481,7 +481,7 @@ const config = {
     updateCheckUrl: (AGENTS_UPDATE_CHECK_URL ?? "").trim().replace(/\/+$/, ""),
     // NOTE: Cache TTL (ms) for the hub announcements/version fetch. Default 1h.
     updatesTtlMs: parseIntSetting(
-      HUB_UPDATES_TTL_MS,
+      
       "HUB_UPDATES_TTL_MS",
       3_600_000,
       "It is how long the hub announcements and version check are cached.",

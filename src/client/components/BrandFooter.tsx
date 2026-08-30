@@ -3,7 +3,7 @@ import { DEFAULT_BRAND_NAME } from "@/lib/branding";
 
 // The auth-page footer: "© {year} {brandName}". The brand name follows the global white-label
 // config. When it is the default it links to the product site; a custom brand renders as plain
-// text (linking a white-label brand back to fazer.ai would be misleading).
+// text.
 export function BrandFooter() {
   const { brandName } = useBranding();
   const year = new Date().getFullYear();
@@ -15,7 +15,7 @@ export function BrandFooter() {
         {year}{" "}
         {isDefault ? (
           <a
-            href="https://fazer.ai"
+            href="https://wootytalk.com"
             className="text-text-secondary hover:text-text-primary hover:underline"
             target="_blank"
             rel="noopener noreferrer"
