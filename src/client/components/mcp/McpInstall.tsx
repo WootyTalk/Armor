@@ -11,7 +11,7 @@ import { HermesIcon } from "@/client/components/icons/HermesIcon";
 import { cn } from "@/client/lib/utils";
 
 // MCP server id shown in the client config; arbitrary, surfaces as the tool namespace prefix.
-const SERVER_ID = "fazer-ai";
+const SERVER_ID = "wootytalk-agents";
 
 // Where a snippet goes: a shell command ("terminal") or a literal config-file path.
 type Snippet = { location: string; code: string };

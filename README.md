@@ -2,10 +2,10 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="public/assets/logo.png">
-  <img alt="fazer.ai agents" src="public/assets/logo-light.png" width="200">
+  <img alt="wootytalk-agents" src="public/assets/logo-light.png" width="200">
 </picture>
 
-# fazer.ai agents
+# wootytalk-agents
 
 **Agentes de IA que assumem seu atendimento.**
 Falam como gente, agendam, cobram e vendem. Self-hosted, com qualquer modelo.
@@ -23,7 +23,7 @@ Falam como gente, agendam, cobram e vendem. Self-hosted, com qualquer modelo.
 
 ---
 
-**fazer.ai agents** é a plataforma self-hosted de agentes de IA que tocam o atendimento: transcrevem áudios, leem imagens, respondem por texto ou por voz, consultam a base de conhecimento, agendam, orçam, cobram, movem o funil e sabem quando passar para o time humano. No WhatsApp e em qualquer outro canal, tudo na sua própria infraestrutura.
+**wootytalk-agents** é a plataforma self-hosted de agentes de IA que tocam o atendimento: transcrevem áudios, leem imagens, respondem por texto ou por voz, consultam a base de conhecimento, agendam, orçam, cobram, movem o funil e sabem quando passar para o time humano. No WhatsApp e em qualquer outro canal, tudo na sua própria infraestrutura.
 
 ### Destaques
 
@@ -35,7 +35,7 @@ Falam como gente, agendam, cobram e vendem. Self-hosted, com qualquer modelo.
 
 ## 🚀 Comece agora
 
-Do primeiro comando ao agente atendendo no WhatsApp, conduzido por um **agente de IA no seu terminal**. Uma linha só instala o CLI, autentica na fazer.ai, conecta os MCPs e instala a skill de onboarding, que sobe a stack completa (Chatwoot + fazer.ai agents + observability, com TLS) num VPS e valida a instância ponta a ponta.
+Do primeiro comando ao agente atendendo no WhatsApp, conduzido por um **agente de IA no seu terminal**. Uma linha só instala o CLI, autentica na fazer.ai, conecta os MCPs e instala a skill de onboarding, que sobe a stack completa (Chatwoot + wootytalk-agents + observability, com TLS) num VPS e valida a instância ponta a ponta.
 
 **macOS e Linux**
 

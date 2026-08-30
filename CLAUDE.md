@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-**fazer.ai agents** é uma aplicação fullstack TypeScript (**Bun + Elysia + React 19 + Tailwind CSS v4**, Prisma/PostgreSQL, JWT, i18n, Biome) que roda **LangGraph TS** no backend para orquestrar agentes de atendimento (IA) sobre o **Chatwoot** fazer.ai. Construída sobre o template **bunfire** (cujos invariantes seguem documentados abaixo). Multi-tenant (`tenant_id` em tudo, isolamento por Prisma `$extends` + RLS), "um core, três transportes" (REST v1, MCP server, UI projetam sobre os mesmos services), distribuição Free (open-source) vs Full.
+**wootytalk agents** é uma aplicação fullstack TypeScript (**Bun + Elysia + React 19 + Tailwind CSS v4**, Prisma/PostgreSQL, JWT, i18n, Biome) que roda **LangGraph TS** no backend para orquestrar agentes de atendimento (IA) sobre o **Chatwoot** wootytalk. Construída sobre o template **bunfire** (cujos invariantes seguem documentados abaixo). Multi-tenant (`tenant_id` em tudo, isolamento por Prisma `$extends` + RLS), "um core, três transportes" (REST v1, MCP server, UI projetam sobre os mesmos services), distribuição Free (open-source) vs Full.
 
 Guia detalhado por subsistema vive em [`docs/`](docs/); as seções abaixo cobrem o que não cabe lá ou que você deve manter em memória de trabalho.
 
@@ -134,7 +134,7 @@ The three operational **skills** (`.claude/skills/agents-{onboarding,operation,d
 
 ## Branding
 
-- "fazer.ai" is always lowercase. "fazer-ai" is acceptable in slugs/identifiers. Never "Fazer.ai" or "Fazer.AI"
+- "wootytalk" is always lowercase. "wootytalk" is acceptable in slugs/identifiers. Never "Fazer.ai" or "Fazer.AI"
 
 ## UX
 
